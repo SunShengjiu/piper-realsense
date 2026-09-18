@@ -296,6 +296,10 @@ class RealsenseCamera:
             firmware = "unknown"
 
         cfg = rs.config()
+        if self.serial:
+            # 必须把 pipeline 绑定到指定序列号；否则多相机时第二个 pipeline
+            # 可能再次抢占第一台设备，表现为 VIDIOC_S_FMT/Device busy。
+            cfg.enable_device(self.serial)
         c = self.requested["color"]
         d = self.requested["depth"]
         cfg.enable_stream(rs.stream.color, c["width"], c["height"], FORMAT_MAP[c["format"]], c["fps"])

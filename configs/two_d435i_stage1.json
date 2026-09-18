@@ -1,0 +1,46 @@
+{
+  "stage": "two_d435i_read_only_verification",
+  "cameras": {
+    "wrist": {
+      "role": "臂载相机",
+      "serial": "241122071942",
+      "usb_type_observed": "3.2",
+      "streams": {
+        "color": {"width": 1280, "height": 720, "fps": 30, "format": "bgr8"},
+        "depth": {"width": 1280, "height": 720, "fps": 30, "format": "z16"}
+      },
+      "depth_alignment": "RealSense rs.align(depth_to_color), aligned to this camera RGB"
+    },
+    "third_person": {
+      "role": "第三视角相机",
+      "serial": "042222071742",
+      "usb_type_observed": "3.2",
+      "streams": {
+        "color": {"width": 1280, "height": 720, "fps": 30, "format": "bgr8"},
+        "depth": {"width": 1280, "height": 720, "fps": 30, "format": "z16"}
+      },
+      "depth_alignment": "RealSense rs.align(depth_to_color), aligned to this camera RGB"
+    }
+  },
+  "robot": {
+    "backend": "piper_sdk_direct_can",
+    "can_interface": "can0",
+    "read_only": true,
+    "joint_unit": "rad",
+    "gripper_unit": "mm only when calibrated",
+    "ee_pose_unit": "m + wxyz",
+    "motion_commands_sent": false
+  },
+  "synchronization": {
+    "hardware_sync": false,
+    "software_match_basis": "nearest host frameset receive time",
+    "tolerance_ms": 33.0,
+    "record_device_timestamp": true,
+    "record_timestamp_domain": true,
+    "record_host_receive_timestamp": true
+  },
+  "targets": {
+    "lerobot_library": "0.6.x (patch version to lock in phase two)",
+    "dataset_format": "LeRobotDataset v3.0"
+  }
+}
