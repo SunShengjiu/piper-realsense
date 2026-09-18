@@ -1,0 +1,2 @@
+# Locked phase-two writer stack.  LeRobot v0.6.1 requires Python >=3.12.
+lerobot[dataset]==0.6.1

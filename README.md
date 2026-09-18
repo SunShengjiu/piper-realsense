@@ -95,6 +95,7 @@ python3 -m piper_capture.cli capture --camera-only --scene scene-tabletop --dura
 | `verify-fk [--urdf P]` | 正运动学三方交叉校验（本项目 DH / piper_sdk / 官方 URDF） |
 
 退出码：`0` 成功；`1` 环境或运行失败；`2` 前置条件不满足（标定未通过验证、点数不足、文件不存在、未加 `--allow-motion` 等）。
+`doctor` 在 CAN 接口健康但**总线上无节点发帧**时（见 9.5）会报 `fail` 并返回 `1`。
 
 ## 4. 采集语义（重要约定）
 
@@ -379,3 +380,145 @@ bash /home/robot/mujoco/piper_ros/can_activate.sh can0 1000000
 即：**驱动器从未使能、也从未回零**。官方流程是先发 `status_code = 0x01` 使能再发
 行程指令；未使能时行程指令不会正常执行，表现为"发了指令但开合不稳定/无响应"。
 `gripper calibrate` 需要的多点实测开度仍然缺失，`gripper_width_mm` 保持为 `null`。
+
+### 9.5 `doctor` 现在会探测总线流量（接口健康 ≠ 机械臂在发帧）
+
+第 9.1 节的教训是：`can0` 显示 `UP` / `ERROR-ACTIVE` / 错误计数全 0，**并不能**说明
+机械臂在通信。因此 `doctor` 的 CAN 检查已改为**只读比较 1.5 秒前后的 `rx_packets`**：
+
+- 有增量 → `pass`，并给出 `≈N 帧/s`；
+- 增量为 0 → `fail`，提示"接口本身正常，但总线上没有节点在发帧"，
+  让 `doctor` 退出码为 `1`。此时应查机械臂供电与 CAN 接线，而不是反复激活接口。
+
+2026-09-18 最近一次实测仍是**增量为 0**（`13406863 → 13406863`）：控制器零错误、
+`cansend` 无 `ENOBUFS`、适配器仍绑在 `gs_usb`（`parentdev 3-7:1.0`、`1d50:606f`），
+即适配器侧健康但总线上无节点发帧，与 9.1 的 USB 通路故障表现**不同**，
+更像机械臂未上电或未接到总线。**该项仍未闭环，需人工检查硬件。**
+
+## 10. LeRobotDataset v3（第二阶段）
+
+双 D435i + PiPER 直接写官方 `LeRobotDataset` v3。环境用 `uv` 在用户目录装 Python
+3.12（系统 Python 是 3.10，**不要**用 `python3.12 -m venv`，本机没有 `python3.12`）：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+uv venv --python 3.12 .venv-lerobot
+uv pip install --python .venv-lerobot/bin/python -r requirements-lerobot.txt
+. .venv-lerobot/bin/activate
+
+python -m piper_capture.cli --config configs/lerobot_v3_two_d435i.json \
+  capture-lerobot --duration 5
+python -m piper_capture.cli verify-lerobot \
+  --root dataset/lerobot_v3 --repo-id piper_two_d435i
+```
+
+输出目录由官方写入器管理（`meta/`、`data/`、`videos/` 与 episode 索引）。
+采集器不会用旧帧或黑帧填补缺帧；实时编码队列溢出会清理未完成 episode 并返回失败。
+
+### 10.1 视频编码器必须写死，不能用 `auto`（已实测的坑）
+
+**`rgb_encoder.vcodec` 必须显式写 `h264`（即 libx264），不要用 `"auto"`。**
+
+LeRobot 的 `auto` 只调用 `detect_available_encoders_pyav()` 检查编码器**是否被编译进
+PyAV**，不检查它**能否真正打开**。本机 PyAV 15.1.0 列出了 `h264_nvenc`/`hevc_nvenc`，
+于是 `auto` 选中 `h264_nvenc`，随后在编码线程里失败：
+
+```
+RuntimeError: Encoder thread for observation.images.wrist failed:
+  [Errno 22] Invalid argument: 'avcodec_open2(h264_nvenc)'
+```
+
+实测环境（PyAV 15.1.0 捆绑 libavcodec 61.19.101、NVIDIA 驱动 580.65.06 / CUDA 13.0、
+RTX 5080、`libnvidia-encode.so.580.65.06` 存在）：**nvenc 无论沙箱内外、无论
+640×480 还是 1280×720，`avcodec_open2` 一律失败**（`EINVAL` 或 `AVERROR_EXTERNAL`），
+即该 PyAV 捆绑的 nvenc 在本机不可用。系统静态 ffmpeg 7.0.2 也没有编译 nvenc。
+因此两台配置都改成显式软件编码器：
+
+```json
+"rgb_encoder": {"vcodec": "h264", "crf": 18, "g": 2, "preset": "veryfast"}
+```
+
+深度仍用 `hevc` + `pix_fmt: gray12le` + `x265-params: lossless=1`（软件 libx265）。
+
+### 10.2 软件编码吞吐实测（4 路并发，预生成帧后纯计时编码）
+
+| 分辨率 | 流 | 实测 | 需要 | 余量 |
+| --- | --- | --- | --- | --- |
+| 1280×720 | RGB h264 veryfast ×2 | 126.6 / 125.9 fps | 30 | ≈4.2× |
+| 1280×720 | depth hevc lossless ×2 | 143.7 / 142.0 fps | 30 | ≈4.8× |
+| 640×480 | RGB h264 veryfast ×2 | 57.6 / 62.0 fps | 30 | ≈2× |
+| 640×480 | depth hevc lossless ×2 | 199.2 / 202.2 fps | 30 | ≈6.6× |
+
+CPU 为 Ryzen 9 9950X（32 线程），软件编码有充足余量，不需要 nvenc。
+
+### 10.3 已验证 / 未验证
+
+**已验证**（合成帧走官方写入器全链路，不代表任何实测机械臂/相机数据）：用配置里的
+编码器设置 `LeRobotDataset.create` → `add_frame` ×30 → `save_episode` → `finalize`，
+无编码队列丢弃；再用官方加载器重载，`frames=30`、四路 `video_keys`/`depth_keys` 齐全、
+RGB 解码 `(3,720,1280)`、深度 `(1,720,1280)`，`observation.state` 与
+`observation.ee_pose` 均为 `(7,)`。
+
+**未验证**：真机 `capture-lerobot` 尚未成功。两台 D435i 都已连接（均报 USB 3.2、
+均支持 1280×720@30），但当前 **`can0` 总线完全静默**：被动监听 10 秒 0 帧，
+控制器 `bus-errors`/`arbit-lost`/`bus-off` 全为 0，`rx_packets` 冻结在 13406863，
+`cansend` 无 `ENOBUFS`、适配器仍绑在 `gs_usb`（`parentdev 3-7:1.0`，`1d50:606f`）。
+即**适配器侧健康、总线上没有节点在发**，与第 9.1 节那次的 USB 通路故障表现不同，
+更像是机械臂未上电或未接到总线。硬件恢复后按上面命令重跑即可。
+
+另：`torchcodec` 在本机加载失败（缺 `libavdevice.so.58`），LeRobot 会告警并自动回退
+到 `pyav`，不影响编码与解码，可忽略。
+
+### 10.4 深度量化是有损的，`depth_min` 必须写 0.0
+
+**结论先说**：LeRobot 的深度是 **12-bit 对数量化**，这一步本身**有损**；
+`x265-params: lossless=1` 只保证 HEVC 编解码对那 12-bit 码值无损，**不能**把
+"深度→码值"的量化误差变回 0。而且 LeRobot **没有为无效值保留码位**，
+所以 `depth_min` 必须写 `0.0`，否则传感器"无测量"会被伪造成一个真实距离。
+
+**1) `depth_min` 的语义**：源码 `.venv-lerobot/.../lerobot/datasets/depth_utils.py`
+的 `quantize_depth()` 里，`depth_min` 是 **quantum 0 对应的深度**：
+
+```python
+norm = (np.log(depth_f + shift_u) - log_min) / (log_max - log_min)   # use_log=True
+quantized = np.rint(norm * DEPTH_QMAX).clip(0, DEPTH_QMAX).astype(np.uint16)
+```
+
+没有任何分支把"无效值"映射到专用码位；D435i 的 `raw=0`（该像素无测量）会顺着公式
+落到 `quantum 0`，解码回来就是 `depth_min`。
+
+**2) 实测对比**（`/tmp/lr_depth_quant.py`，往返 `quantize → dequantize`）：
+
+| `depth_min` | 输入 `raw=0`（无测量） | 读回 | 语义 |
+| --- | --- | --- | --- |
+| `0.01`（LeRobot 默认） | code 0 | **0.010000 m** | 把"无测量"伪造成 10 mm |
+| `0.0`（本项目） | code 0 | **0.000000 m** | 保住 `0 = 无效` |
+
+因此两个配置都写 `"depth_min": 0.0`（`depth_encoder_note` 同步记录了理由）。
+
+**3) 量化误差实测**（`depth_min=0.0` / `depth_max=10.0` / `shift=3.5` / `use_log=true`，
+走真实数据集写入 + 重载，含 HEVC lossless 编解码，`/tmp/lr_depth_e2e.py`）：
+
+| 真实深度 | 读回 | 往返误差 |
+| --- | --- | --- |
+| 0.000 m（无测量） | 0.000000 m | 0（语义保住） |
+| 0.05 m | 0.049966 m | −0.03 mm |
+| 0.10 m | 0.099458 m | −0.54 mm |
+| 0.50 m | 0.499911 m | −0.09 mm |
+| 1.00 m | 0.999462 m | −0.54 mm |
+| 1.50 m | 1.500044 m | +0.04 mm |
+| 2.00 m | 1.999826 m | −0.17 mm |
+| 3.00 m | 3.000313 m | +0.31 mm |
+| 5.00 m | 5.001029 m | +1.03 mm |
+| 10.00 m | 10.000000 m | 0 |
+| 12.00 m（超 `depth_max`） | 10.000000 m | 被截断到 `depth_max` |
+
+误差量与理论一致：12-bit 对数刻度的码距是
+`ln(depth_max+shift) - ln(depth_min+shift)` 均分 4095 份，
+在深度 `d` 处的步长 ≈ `步长_log × (d + shift)`，故**近处细、远处粗**：
+0.5 m 处约 1.0 mm/码、1 m 处约 1.5 mm/码、5 m 处约 2.8 mm/码
+（上表误差均在半码内）。工作距离内误差 ≤1 mm，满足采集需求；
+但**这不是无损**，不能对外宣称深度无损。超 `depth_max` 的值会被 `clip` 到 10 m，
+D435i 本身在 10 m 外基本无有效测量，影响可忽略。
+需要完全无损时只能不用视频编码器（本项目第一阶段 PNG `uint16` 路径是逐像素无损的，
+见第 4 节与数据字典）。

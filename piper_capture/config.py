@@ -112,6 +112,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fsync_every": 0,
         "stop_on_robot_timeout": False,
     },
+    # ---------------- LeRobot v3 direct writer ----------------
+    "lerobot": {
+        "repo_id": "piper_two_d435i",
+        "output_root": "dataset/lerobot_v3",
+        "encoder_queue_maxsize": 30,
+        "encoder_threads": None,
+        # 不要用 "auto"：LeRobot 的 auto 只检查编码器是否被编译进 PyAV，不检查能否打开，
+        # 本机会选中 h264_nvenc 然后在编码线程里 avcodec_open2 失败，整条 episode 作废（README 10.1）。
+        "rgb_encoder": {"vcodec": "h264", "crf": 18, "g": 2, "preset": "veryfast"},
+        # DepthEncoderConfig parameters are metres.  Input frames are converted
+        # with each D435i's measured depth_scale before add_frame.
+        "depth_encoder": {
+            # depth_min 是 quantum 0 对应的深度，LeRobot 没为无效值留码位：
+            # 写 0.01 会把传感器 raw=0（无测量）读回成 10 mm，破坏 0=无效 的语义（README 10.4）。
+            "vcodec": "hevc", "pix_fmt": "gray12le", "depth_min": 0.0,
+            "depth_max": 10.0, "shift": 3.5, "use_log": True,
+            "extra_options": {"x265-params": "lossless=1"},
+        },
+    },
     # ---------------- 手眼标定 ----------------
     "handeye": {
         "mode": "eye_in_hand",
@@ -181,6 +200,19 @@ def load_config(path: str | Path | None = None, *, overrides: Dict[str, Any] | N
         raise ConfigError("robot.dh_is_offset 只能是 0 或 1")
     if cfg["handeye"]["mode"] not in ("eye_in_hand", "eye_to_hand"):
         raise ConfigError("handeye.mode 只能是 eye_in_hand 或 eye_to_hand")
+    if "wrist" in cfg.get("camera", {}) or "third_person" in cfg.get("camera", {}):
+        for role in ("wrist", "third_person"):
+            spec = cfg["camera"].get(role)
+            if not isinstance(spec, dict) or not spec.get("serial"):
+                raise ConfigError(f"camera.{role}.serial 必须填写第一阶段确认的设备序列号")
+            streams = spec.get("streams", {})
+            for stream in ("color", "depth"):
+                if streams.get(stream, {}).get("fps") != 30:
+                    raise ConfigError(f"camera.{role}.streams.{stream}.fps 必须为已验证的 30 fps")
+    if "lerobot" in cfg:
+        depth = cfg["lerobot"].get("depth_encoder", {})
+        if depth.get("depth_min", 0) >= depth.get("depth_max", 0):
+            raise ConfigError("lerobot.depth_encoder.depth_min 必须小于 depth_max；单位为米")
     return cfg
 
 

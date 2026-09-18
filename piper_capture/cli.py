@@ -75,9 +75,50 @@ def _can_status(iface: str) -> Dict[str, Any]:
 
     healthy = bool(up and state and state.upper() in ("ERROR-ACTIVE", "ERROR-WARN"))
     if healthy:
+        # 接口健康 ≠ 总线上有节点在发帧。只读地比较 1.5 s 前后的 rx_packets。
+        # 实测遇到过：接口 UP / ERROR-ACTIVE、错误计数全 0，但总线上一个反馈帧都没有
+        # （机械臂未上电或 CAN 线未接），此时只看接口状态会误报 pass。
+        rx0 = rx["packets"] if rx else None
+        rx1 = None
+        if rx0 is not None:
+            import time
+
+            time.sleep(1.5)
+            try:
+                p2 = subprocess.run(
+                    ["ip", "-details", "-statistics", "link", "show", iface],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                m2 = re.search(
+                    r"RX:.*?\n\s*(\d+)\s+(\d+)", (p2.stdout or "") + (p2.stderr or ""), re.S
+                )
+                rx1 = int(m2.group(2)) if m2 else None
+            except Exception as exc:
+                evidence["traffic_probe_error"] = str(exc)
+        delta = (rx1 - rx0) if (rx0 is not None and rx1 is not None) else None
+        evidence["rx_packets_delta_1_5s"] = delta
+
+        if delta == 0:
+            return {
+                "status": "fail",
+                "detail": f"{iface} 接口本身正常（UP / {state} / bitrate={bitrate}），但 1.5 秒内 "
+                f"rx_packets 没有增加（{rx0} → {rx1}），即总线上没有节点在发帧。"
+                "接口健康不等于机械臂在通信：请检查机械臂是否上电、CAN 线是否接到适配器、"
+                "接线/终端电阻是否正常。本项目不会自行激活或修改 CAN 配置。",
+                "evidence": evidence,
+            }
+        if delta is None:
+            return {
+                "status": "pass",
+                "detail": f"UP / {state} / bitrate={bitrate} / rx_packets={rx0}（总线流量未探测）",
+                "evidence": evidence,
+            }
         return {
             "status": "pass",
-            "detail": f"UP / {state} / bitrate={bitrate} / rx_packets={rx['packets'] if rx else '?'}",
+            "detail": f"UP / {state} / bitrate={bitrate} / rx_packets={rx0}"
+            f" / 1.5s 内 +{delta} 帧（≈{delta / 1.5:.1f} 帧/s）",
             "evidence": evidence,
         }
     reasons = []
@@ -302,6 +343,24 @@ def cmd_capture(args: argparse.Namespace) -> int:
     summary = session.run()
     _print(summary)
     return 0 if summary.get("status") in ("closed", "aborted") else 1
+
+
+def cmd_capture_lerobot(args: argparse.Namespace) -> int:
+    from .lerobot_writer import LeRobotCaptureSession
+
+    cfg = _cfg(args)
+    session = LeRobotCaptureSession(cfg, base_dir=Path.cwd(), duration_s=args.duration, task=args.task)
+    summary = session.run()
+    _print(summary)
+    return 0 if summary.get("status") in ("closed", "aborted") else 1
+
+
+def cmd_verify_lerobot(args: argparse.Namespace) -> int:
+    from .lerobot_writer import verify_lerobot_dataset
+
+    result = verify_lerobot_dataset(Path(args.root), args.repo_id)
+    _print(result)
+    return 0
 
 
 # --------------------------------------------------------------------------- handeye
@@ -536,6 +595,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--verbose", action="store_true")
     c.set_defaults(func=cmd_capture)
 
+    lc = sub.add_parser("capture-lerobot", help="两台 D435i + PiPER 直接写 LeRobotDataset v3")
+    lc.add_argument("--duration", type=float, default=None, help="秒；不指定则持续到 Ctrl-C")
+    lc.add_argument("--task", default="piper observation")
+    lc.set_defaults(func=cmd_capture_lerobot)
+
+    lv = sub.add_parser("verify-lerobot", help="官方 LeRobotDataset 重新加载并检查字段")
+    lv.add_argument("--root", required=True)
+    lv.add_argument("--repo-id", default="piper_two_d435i")
+    lv.set_defaults(func=cmd_verify_lerobot)
+
     h = sub.add_parser("handeye", help="手眼标定")
     hsub = h.add_subparsers(dest="sub", required=True)
     hs = hsub.add_parser("sample", help="交互采样（人工调整姿态，回车记录）")
@@ -642,6 +711,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (ValueError, FileNotFoundError, PermissionError) as exc:
         # 输入/环境不满足前置条件（如点数不足、文件不存在、未加 --allow-motion）
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(f"RuntimeError: {exc}", file=sys.stderr)
         return 2
 
 
