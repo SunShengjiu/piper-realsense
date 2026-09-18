@@ -214,6 +214,7 @@ class CaptureSession:
             warmup_frames=int(cam_cfg.get("warmup_frames", 30)),
             frame_timeout_ms=int(cam_cfg.get("frame_timeout_ms", 5000)),
             calibration_id=cam_cfg.get("calibration_id"),
+            sensor_options=cam_cfg.get("sensor_options"),
         )
         camera_model = self.camera.open()
         store = CalibrationStore(self.root)

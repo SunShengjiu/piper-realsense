@@ -1,0 +1,117 @@
+{
+  "dataset_root": "dataset",
+  "camera": {
+    "wrist": {
+      "role": "wrist",
+      "serial": "241122071942",
+      "streams": {
+        "color": {
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "format": "bgr8"
+        },
+        "depth": {
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "format": "z16"
+        }
+      },
+      "sensor_options": {
+        "color": {
+          "enable_auto_exposure": 0.0,
+          "exposure": 1000.0,
+          "gain": 0.0,
+          "enable_auto_white_balance": 1.0,
+          "brightness": 0.0,
+          "contrast": 50.0,
+          "saturation": 64.0,
+          "sharpness": 50.0,
+          "gamma": 300.0,
+          "hue": 0.0,
+          "backlight_compensation": 0.0,
+          "power_line_frequency": 3.0,
+          "auto_exposure_priority": 0.0
+        }
+      }
+    },
+    "third_person": {
+      "role": "third_person",
+      "serial": "042222071742",
+      "streams": {
+        "color": {
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "format": "bgr8"
+        },
+        "depth": {
+          "width": 1280,
+          "height": 720,
+          "fps": 30,
+          "format": "z16"
+        }
+      },
+      "sensor_options": {
+        "color": {
+          "enable_auto_exposure": 0.0,
+          "exposure": 1000.0,
+          "gain": 0.0,
+          "enable_auto_white_balance": 1.0,
+          "brightness": 0.0,
+          "contrast": 50.0,
+          "saturation": 64.0,
+          "sharpness": 50.0,
+          "gamma": 300.0,
+          "hue": 0.0,
+          "backlight_compensation": 0.0,
+          "power_line_frequency": 3.0,
+          "auto_exposure_priority": 0.0
+        }
+      }
+    },
+    "warmup_frames": 30,
+    "frame_timeout_ms": 5000
+  },
+  "robot": {
+    "enabled": true,
+    "read_only": true,
+    "can_interface": "can0",
+    "dh_is_offset": 1
+  },
+  "capture": {
+    "target_sample_rate": 30.0,
+    "sync": {
+      "tolerance_ms": 33.0,
+      "robot_tolerance_ms": 33.0,
+      "max_robot_state_age_ms": 50.0,
+      "robot_match_mode": "nearest"
+    }
+  },
+  "lerobot": {
+    "repo_id": "piper_two_d435i",
+    "output_root": "dataset/lerobot_v3",
+    "encoder_queue_maxsize": 30,
+    "encoder_threads": null,
+    "rgb_encoder_note": "必须写死软件编码器 h264(libx264)。不要用 auto：LeRobot 的 auto 只检查编码器是否被编译进 PyAV，不检查能否真正打开，本机会选中 h264_nvenc 然后 avcodec_open2 失败(EINVAL/AVERROR_EXTERNAL)，整条 episode 作废。实测 PyAV 15.1.0 + 驱动 580.65.06 下 h264_nvenc/hevc_nvenc 均无法初始化。",
+    "rgb_encoder": {
+      "vcodec": "h264",
+      "crf": 18,
+      "g": 2,
+      "preset": "veryfast"
+    },
+    "depth_encoder": {
+      "vcodec": "hevc",
+      "pix_fmt": "gray12le",
+      "depth_min": 0.0,
+      "depth_max": 10.0,
+      "shift": 3.5,
+      "use_log": true,
+      "extra_options": {
+        "x265-params": "lossless=1"
+      }
+    },
+    "depth_encoder_note": "depth_min 必须为 0.0：LeRobot 把 depth_min 定义为 quantum 0 对应的深度，且没有为无效值保留码位。若用默认 0.01，传感器 raw=0（无测量）会被量化到 quantum 0 再读回成 0.010000 m，等于把'无测量'伪造成 10mm，破坏 0=无效 的语义。实测 depth_min=0.0 时 raw=0 -> 0.000000 m，且 0.1~5m 量化误差仍 <=1mm。x265-params lossless=1 只保证编解码对 12bit 码值无损，深度到 12bit 的量化本身是有损的（见 README 10.4）。"
+  }
+}

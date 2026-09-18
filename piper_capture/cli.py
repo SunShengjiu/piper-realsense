@@ -355,6 +355,25 @@ def cmd_capture_lerobot(args: argparse.Namespace) -> int:
     return 0 if summary.get("status") in ("closed", "aborted") else 1
 
 
+def cmd_capture_lerobot_interactive(args: argparse.Namespace) -> int:
+    from .interactive_capture import run_interactive
+
+    return run_interactive(
+        config=args.config,
+        dataset_root=args.dataset_root,
+        task=args.task,
+        episodes=args.episodes,
+    )
+
+
+def cmd_camera_ui(args: argparse.Namespace) -> int:
+    from .camera_tuner import serve
+
+    source = args.config or "configs/lerobot_v3_two_d435i.json"
+    output = args.output or str(Path(source).with_name(Path(source).stem + "_tuned.json"))
+    return serve(source, output, args.port, not args.no_browser)
+
+
 def cmd_verify_lerobot(args: argparse.Namespace) -> int:
     from .lerobot_writer import verify_lerobot_dataset
 
@@ -586,6 +605,12 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--seconds", type=float, default=8.0)
     cp.set_defaults(func=cmd_camera_probe)
 
+    ui = sub.add_parser("camera-ui", help="双 D435i 实时预览、调参并保存采集配置")
+    ui.add_argument("--output", help="保存配置路径，默认源文件名加 _tuned.json")
+    ui.add_argument("--port", type=int, default=8766)
+    ui.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ui.set_defaults(func=cmd_camera_ui)
+
     c = sub.add_parser("capture", help="采集一个 episode（默认只读机械臂）")
     c.add_argument("--scene", default="scene-tabletop")
     c.add_argument("--episode", default=None)
@@ -599,6 +624,14 @@ def build_parser() -> argparse.ArgumentParser:
     lc.add_argument("--duration", type=float, default=None, help="秒；不指定则持续到 Ctrl-C")
     lc.add_argument("--task", default="piper observation")
     lc.set_defaults(func=cmd_capture_lerobot)
+
+    li = sub.add_parser(
+        "capture-lerobot-interactive",
+        help="交互采集：按空格开始 episode，按 q 结束并保存",
+    )
+    li.add_argument("--episodes", type=int, default=None, help="完成指定数量后退出；默认持续到 Ctrl-C")
+    li.add_argument("--task", default="piper observation")
+    li.set_defaults(func=cmd_capture_lerobot_interactive)
 
     lv = sub.add_parser("verify-lerobot", help="官方 LeRobotDataset 重新加载并检查字段")
     lv.add_argument("--root", required=True)

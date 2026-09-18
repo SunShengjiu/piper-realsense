@@ -104,6 +104,8 @@ class FramePair:
     # 有用统计
     invalid_depth_pixels: int = 0
     aligned_invalid_pixels: int = 0
+    infrared_left_u8: Optional[np.ndarray] = None
+    infrared_right_u8: Optional[np.ndarray] = None
 
     @property
     def pair_dt_ms(self) -> float:
@@ -127,6 +129,7 @@ class CameraModel:
     spec_match: bool
     spec_mismatch_reason: Optional[str]
     warnings: List[str] = field(default_factory=list)
+    sensor_options: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -148,6 +151,7 @@ class CameraModel:
             "spec_match": self.spec_match,
             "spec_mismatch_reason": self.spec_mismatch_reason,
             "warnings": self.warnings,
+            "sensor_options": self.sensor_options,
             "optical_frames": {
                 "color": "camera_color_optical_frame (RGB 光学系, +z 前, +x 右, +y 下)",
                 "depth": "camera_depth_optical_frame (Depth 光学系)",
@@ -177,6 +181,8 @@ class RealsenseCamera:
         warmup_frames: int = 30,
         frame_timeout_ms: int = 5000,
         calibration_id: Optional[str] = None,
+        sensor_options: Optional[Dict[str, Any]] = None,
+        enable_infrared: bool = False,
     ) -> None:
         self.serial = serial
         self.requested = {
@@ -187,6 +193,9 @@ class RealsenseCamera:
         self.warmup_frames = int(warmup_frames)
         self.frame_timeout_ms = int(frame_timeout_ms)
         self.requested_calibration_id = calibration_id
+        self.sensor_options = sensor_options or {}
+        # Extra streams are for tuning; normal dataset capture stays RGB-D.
+        self.enable_infrared = bool(enable_infrared)
         self.model: Optional[CameraModel] = None
         self._pipeline = None
         self._align = None
@@ -304,10 +313,19 @@ class RealsenseCamera:
         d = self.requested["depth"]
         cfg.enable_stream(rs.stream.color, c["width"], c["height"], FORMAT_MAP[c["format"]], c["fps"])
         cfg.enable_stream(rs.stream.depth, d["width"], d["height"], FORMAT_MAP[d["format"]], d["fps"])
+        if self.enable_infrared:
+            for index in (1, 2):
+                cfg.enable_stream(rs.stream.infrared, index, d["width"], d["height"], rs.format.y8, d["fps"])
 
         self._pipeline = rs.pipeline()
         self._profile = self._pipeline.start(cfg)
         self._align = rs.align(rs.stream.color)
+        from .camera_options import apply_options, saved_options
+        try:
+            apply_options(self._profile.get_device(), rs, self.sensor_options)
+        except Exception:
+            self.close()
+            raise
 
         actual = self._collect_actual_streams()
         mismatch = self._spec_mismatch(actual)
@@ -341,6 +359,7 @@ class RealsenseCamera:
             spec_match=not mismatch,
             spec_mismatch_reason="; ".join(mismatch) if mismatch else None,
             warnings=warnings,
+            sensor_options=saved_options(self._profile.get_device(), rs),
         )
         for _ in range(max(0, self.warmup_frames)):
             self._pipeline.wait_for_frames(self.frame_timeout_ms)
@@ -445,6 +464,12 @@ class RealsenseCamera:
 
         color_bgr = np.asanyarray(color.get_data())
         depth_raw = np.asanyarray(depth.get_data())
+        infrared = [None, None]
+        if self.enable_infrared:
+            for index in (1, 2):
+                frame = frames.get_infrared_frame(index)
+                if frame:
+                    infrared[index - 1] = np.asanyarray(frame.get_data())
         if aligned_depth:
             depth_aligned = np.asanyarray(aligned_depth.get_data())
         else:
@@ -478,6 +503,8 @@ class RealsenseCamera:
             frameset_host_recv_ns=host_after,
             invalid_depth_pixels=int(np.count_nonzero(depth_raw == 0)),
             aligned_invalid_pixels=int(np.count_nonzero(depth_aligned == 0)) if depth_aligned.size else 0,
+            infrared_left_u8=infrared[0],
+            infrared_right_u8=infrared[1],
         )
         self.counters["invalid_depth_pixels_total"] += pair.invalid_depth_pixels
         return pair

@@ -112,7 +112,8 @@ def _feature_info(*, depth: bool, depth_scale_m: Optional[float] = None) -> Dict
     return info
 
 
-def make_features(height: int, width: int, wrist_depth_scale_m: float, third_depth_scale_m: float) -> Dict[str, Dict[str, Any]]:
+def make_features(height: int, width: int, wrist_depth_scale_m: float, third_depth_scale_m: float,
+                  *, third_height: Optional[int] = None, third_width: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
     """Return the complete v3 feature schema used by this capture."""
     return {
         "observation.images.wrist": {
@@ -126,12 +127,12 @@ def make_features(height: int, width: int, wrist_depth_scale_m: float, third_dep
             "info": _feature_info(depth=True, depth_scale_m=wrist_depth_scale_m),
         },
         "observation.images.third_person": {
-            "dtype": "video", "shape": (height, width, 3),
+            "dtype": "video", "shape": (third_height or height, third_width or width, 3),
             "names": ["height", "width", "channel"],
             "info": _feature_info(depth=False),
         },
         "observation.images.third_person_depth": {
-            "dtype": "video", "shape": (height, width, 1),
+            "dtype": "video", "shape": (third_height or height, third_width or width, 1),
             "names": ["height", "width", "channel"],
             "info": _feature_info(depth=True, depth_scale_m=third_depth_scale_m),
         },
@@ -194,6 +195,7 @@ class LeRobotCaptureSession:
         s = spec["streams"]
         return RealsenseCamera(
             serial=spec["serial"],
+            sensor_options=spec.get("sensor_options"),
             color_width=s["color"]["width"], color_height=s["color"]["height"], color_fps=s["color"]["fps"], color_format=s["color"]["format"],
             depth_width=s["depth"]["width"], depth_height=s["depth"]["height"], depth_fps=s["depth"]["fps"], depth_format=s["depth"]["format"],
             allow_spec_downgrade=False,
@@ -206,15 +208,54 @@ class LeRobotCaptureSession:
         out = Path(self.cfg["lerobot"]["output_root"])
         if not out.is_absolute():
             out = (self.base_dir / out).resolve()
-        if out.exists() and any(out.iterdir()):
-            raise FileExistsError(
-                f"LeRobot 输出目录已有内容，为避免覆盖历史数据请更换 output_root: {out}"
-                + _describe_existing(out)
-            )
         wc = self.cfg["camera"]["wrist"]["streams"]["color"]
-        features = make_features(int(wc["height"]), int(wc["width"]), wrist_model.depth_scale_m, third_model.depth_scale_m)
+        tc = self.cfg["camera"]["third_person"]["streams"]["color"]
+        features = make_features(int(wc["height"]), int(wc["width"]), wrist_model.depth_scale_m,
+                                 third_model.depth_scale_m, third_height=int(tc["height"]), third_width=int(tc["width"]))
         rgb_cfg = RGBEncoderConfig(**self.cfg["lerobot"].get("rgb_encoder", {}))
         depth_cfg = DepthEncoderConfig(**self.cfg["lerobot"].get("depth_encoder", {}))
+        if out.exists() and any(out.iterdir()):
+            info = out / "meta" / "info.json"
+            if not info.is_file():
+                raise FileExistsError(
+                    f"LeRobot 输出目录已有内容，但不是可继续写入的数据集: {out}"
+                    + _describe_existing(out)
+                )
+            # LeRobot 0.6.1 provides resume(), which keeps the existing
+            # metadata and appends the next saved episode instead of creating
+            # a new dataset or overwriting the previous episodes.
+            ds = LeRobotDataset.resume(
+                repo_id=self.cfg["lerobot"].get("repo_id", "piper_two_d435i"),
+                root=out,
+                tolerance_s=float(self.cfg["capture"]["sync"].get("tolerance_ms", 33.0)) / 1000.0,
+                streaming_encoding=True,
+                encoder_queue_maxsize=int(self.cfg["lerobot"].get("encoder_queue_maxsize", 30)),
+                encoder_threads=self.cfg["lerobot"].get("encoder_threads"),
+                rgb_encoder=rgb_cfg,
+                depth_encoder=depth_cfg,
+            )
+            expected_fps = int(self.cfg["capture"]["target_sample_rate"])
+            if int(ds.meta.fps) != expected_fps:
+                raise RuntimeError(
+                    f"已有数据集 fps={ds.meta.fps}，当前配置 fps={expected_fps}，拒绝混合写入: {out}"
+                )
+            for key, spec in features.items():
+                old = ds.meta.features.get(key)
+                if old is None or old.get("dtype") != spec.get("dtype") or tuple(old.get("shape", ())) != tuple(spec.get("shape", ())):
+                    raise RuntimeError(
+                        f"已有数据集字段 {key} 与当前相机规格不一致，拒绝混合写入: {out}"
+                    )
+            for key, serial in (
+                ("observation.images.wrist", self.cfg["camera"]["wrist"]["serial"]),
+                ("observation.images.third_person", self.cfg["camera"]["third_person"]["serial"]),
+            ):
+                old_serial = ds.meta.features[key].get("info", {}).get("camera_serial")
+                if old_serial and old_serial != serial:
+                    raise RuntimeError(
+                        f"已有数据集 {key} 来自相机 {old_serial}，当前为 {serial}，拒绝混合写入: {out}"
+                    )
+        else:
+            ds = None
         # These values are metres in v0.6.x; retain the actual configuration in
         # feature info so decoding is physically reversible.
         for key in DEPTH_KEYS:
@@ -229,24 +270,26 @@ class LeRobotCaptureSession:
                     "pix_fmt": depth_cfg.pix_fmt,
                 }
             })
-        ds = LeRobotDataset.create(
-            repo_id=self.cfg["lerobot"].get("repo_id", "piper_two_d435i"),
-            fps=int(self.cfg["capture"]["target_sample_rate"]),
-            features=features,
-            root=out,
-            robot_type="piper",
-            use_videos=True,
-            tolerance_s=float(self.cfg["capture"]["sync"].get("tolerance_ms", 33.0)) / 1000.0,
-            streaming_encoding=True,
-            encoder_queue_maxsize=int(self.cfg["lerobot"].get("encoder_queue_maxsize", 30)),
-            encoder_threads=self.cfg["lerobot"].get("encoder_threads"),
-            rgb_encoder=rgb_cfg,
-            depth_encoder=depth_cfg,
-        )
+        if ds is None:
+            ds = LeRobotDataset.create(
+                repo_id=self.cfg["lerobot"].get("repo_id", "piper_two_d435i"),
+                fps=int(self.cfg["capture"]["target_sample_rate"]),
+                features=features,
+                root=out,
+                robot_type="piper",
+                use_videos=True,
+                tolerance_s=float(self.cfg["capture"]["sync"].get("tolerance_ms", 33.0)) / 1000.0,
+                streaming_encoding=True,
+                encoder_queue_maxsize=int(self.cfg["lerobot"].get("encoder_queue_maxsize", 30)),
+                encoder_threads=self.cfg["lerobot"].get("encoder_threads"),
+                rgb_encoder=rgb_cfg,
+                depth_encoder=depth_cfg,
+            )
         # Official metadata is the source of directory/video/parquet/index
         # layout.  Only supported feature info is augmented with device facts.
         capture_metadata = {
             "camera_serials": {"wrist": self.cfg["camera"]["wrist"]["serial"], "third_person": self.cfg["camera"]["third_person"]["serial"]},
+            "sensor_options": {"wrist": wrist_model.sensor_options, "third_person": third_model.sensor_options},
             "software_sync": True,
             "matching_basis": "nearest host frameset receive time",
             "tolerance_ms": self.cfg["capture"]["sync"]["tolerance_ms"],

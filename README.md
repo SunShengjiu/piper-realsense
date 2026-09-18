@@ -14,6 +14,34 @@ examples/           数据读取示例
 dataset/            数据集根目录（默认；大体积数据不提交 Git）
 ```
 
+## 日常采集入口：空格开始，q 结束
+
+采集 150 个不同场景的 episode，使用下面这一条命令，**每个 episode 不限时**：
+
+```bash
+cd /home/robot/shucai1
+.venv-lerobot/bin/python -m piper_capture.cli \
+  --config configs/lerobot_v3_two_d435i_150ep.json \
+  capture-lerobot-interactive --episodes 150
+```
+
+1. 开始前确认两台相机和机械臂连接正常，并停止调参页面的预览。
+2. 摆好场景，**按空格**。等待“开始采集”和“已写入 … 样本”后进行演示。
+3. 演示结束，**按英文小写 `q`**，等待“当前 episode 已保存”和“等待开始”。
+4. **保存完成后再换场景**，按空格采集下一条，无需重复输入命令。
+5. 提前结束本轮，在“等待开始”时按 Ctrl-C；下次运行可继续追加。
+
+按键无需回车，终端需要保持输入焦点。不要先换场景再按 `q`。
+`--episodes 150` 指本次运行成功新增 150 条；若已有 40 条、目标总共 150 条，下次用 `--episodes 110`。
+
+数据路径：`/home/robot/shucai1/dataset/lerobot_v3_150ep/`，包含 `meta/`、`data/`、`videos/`。
+一个 episode 不是一帧，也不是一个独立目录；总条数见 `meta/info.json` 的 `total_episodes`。
+当前配置请求双路 RGB-D 1280×720@30，RGB 增益 0、曝光设置值 1000、自动曝光关闭。
+
+**完整步骤、数量查询、续采和故障处理：[数据采集操作指南](docs/data_collection_guide.md)。**
+相机参数调整另见 [相机与红外调参指南](docs/camera_tuning_guide.md)。
+下面的旧版 `capture` 命令与 LeRobot 输出格式不同，日常逐场景采集请使用上面的交互命令。
+
 ## 1. 运行环境（已实测）
 
 | 项 | 实测值 |
@@ -78,7 +106,9 @@ python3 -m piper_capture.cli capture --camera-only --scene scene-tabletop --dura
 | --- | --- |
 | `doctor` | 环境检查：ROS、piper_sdk、RealSense 设备与目标流配置、CAN 接口状态、正运动学三方交叉校验 |
 | `camera-probe [--open] [--seconds N]` | 列出 D435i 支持流配置；`--open` 时实际打开并实测帧率 |
-| `capture [--scene S] [--episode E] [--duration T] [--camera-only] [--verbose]` | 采集一个 episode |
+| `capture [--scene S] [--episode E] [--duration T] [--camera-only] [--verbose]` | 旧版 PNG/JSONL 格式采集一个 episode |
+| `capture-lerobot-interactive [--episodes N]` | 空格开始、q 保存当前 episode，连续追加 LeRobot 数据 |
+| `capture-lerobot [--duration T]` | 单条 LeRobot 采集；不指定时长则 Ctrl-C 保存退出 |
 | `handeye sample --session S` | 手眼标定采样：人工摆姿态，回车记录一帧（不自动规划运动） |
 | `handeye solve --session S [--method M] [--verify-session S2] [--redetect]` | 求解 + 留出验证，写入 `calibrations/handeye/` |
 | `handeye verify --calibration-id ID --session S` | 用指定会话验证已有标定 |
@@ -413,6 +443,8 @@ python -m piper_capture.cli verify-lerobot \
 ```
 
 输出目录由官方写入器管理（`meta/`、`data/`、`videos/` 与 episode 索引）。
+已有兼容数据集通过 `resume()` 追加下一条；新目录通过 `create()` 创建。
+日常多场景采集使用本页开头的 `capture-lerobot-interactive`，下面的 5 秒命令仅作单条示例。
 采集器不会用旧帧或黑帧填补缺帧；实时编码队列溢出会清理未完成 episode 并返回失败。
 
 ### 10.1 视频编码器必须写死，不能用 `auto`（已实测的坑）
@@ -459,12 +491,12 @@ CPU 为 Ryzen 9 9950X（32 线程），软件编码有充足余量，不需要 n
 RGB 解码 `(3,720,1280)`、深度 `(1,720,1280)`，`observation.state` 与
 `observation.ee_pose` 均为 `(7,)`。
 
-**未验证**：真机 `capture-lerobot` 尚未成功。两台 D435i 都已连接（均报 USB 3.2、
-均支持 1280×720@30），但当前 **`can0` 总线完全静默**：被动监听 10 秒 0 帧，
-控制器 `bus-errors`/`arbit-lost`/`bus-off` 全为 0，`rx_packets` 冻结在 13406863，
-`cansend` 无 `ENOBUFS`、适配器仍绑在 `gs_usb`（`parentdev 3-7:1.0`，`1d50:606f`）。
-即**适配器侧健康、总线上没有节点在发**，与第 9.1 节那次的 USB 通路故障表现不同，
-更像是机械臂未上电或未接到总线。硬件恢复后按上面命令重跑即可。
+**现场进展（2026-09-19）**：已生成真机 episode，曾检查到旧目录 `dataset/lerobot_v3`
+包含 1 条、196 帧；另一次试采生成 1 条、677 帧，已按用户要求删除。
+这些记录不代表 150 条采集已完成，也不代表当前硬件始终在线。
+此前 CAN 静默和相机 USB 异常见故障记录；每次采集仍需检查实时状态。
+交互采集已接入官方 `resume()`；已有检查覆盖续开数据集及计数保留，
+完整 150 条连续真机采集尚未验证。
 
 另：`torchcodec` 在本机加载失败（缺 `libavdevice.so.58`），LeRobot 会告警并自动回退
 到 `pyav`，不影响编码与解码，可忽略。
@@ -522,3 +554,46 @@ quantized = np.rint(norm * DEPTH_QMAX).clip(0, DEPTH_QMAX).astype(np.uint16)
 D435i 本身在 10 m 外基本无有效测量，影响可忽略。
 需要完全无损时只能不用视频编码器（本项目第一阶段 PNG `uint16` 路径是逐像素无损的，
 见第 4 节与数据字典）。
+
+## 11. 双相机调参界面
+
+降低深度噪点、调节 D435i 红外曝光 / 增益 / 投射器功率的操作顺序见
+[深度与红外调参指南](docs/data_collection_guide.md)。界面默认打开深度 / 红外参数，
+提供左右红外预览、原始 / 对齐深度切换及红外暗部和饱和比例。
+
+```bash
+cd /home/robot/shucai1
+python3 -m piper_capture.cli --config configs/lerobot_v3_two_d435i.json camera-ui
+```
+
+浏览器打开 **http://127.0.0.1:8766**。使用已有的 `numpy`、`opencv`、
+`pyrealsense2`，网页服务使用 Python 标准库，不需要 Tk、Qt 或 ROS。
+若未自动打开浏览器，手动访问地址即可；`--no-browser` 可关闭自动打开，`--port` 可换端口。
+
+1. 确认腕部和第三人称对应的序列号，选择各自 RGB / Depth 分辨率，点击
+   **连接 / 应用分辨率**。双相机采集保持 30 fps，仅展示设备支持的 BGR8 / Z16 规格。
+2. 在各相机的 **RGB 参数 / 深度参数** 页签调整曝光、增益、白平衡、亮度、
+   对比度、饱和度、锐度、伽马、防闪烁、深度预设、红外发射器和激光功率等。
+   仅显示设备固件支持的图像参数，并使用设备报告的范围/步长。修改即时应用；
+   手动曝光/增益先关闭自动曝光，手动白平衡先关闭自动白平衡。
+3. 每台同时显示 RGB、左右红外与深度；深度默认原始视角，可切换到对齐 RGB。
+   统计包含接收帧率、原始 / 对齐深度有效比例和对齐中心像素距离。
+   深度预览固定映射 0–3 m，黑色表示无效值；这只是显示范围，不截断采集深度。
+4. 点击 **保存参数**，默认保存到源文件同目录的 `*_tuned.json`，重复保存覆盖此文件。
+   可用 `camera-ui --output configs/my_cameras.json` 指定保存位置。
+   原文件里的机械臂、同步、编码等设置会保留；参数按相机序列号和 RGB/Depth 分开存放，
+   自动模式下不保存当时的曝光/白平衡测量值作为手动设定值。
+5. 点击 **停止预览 · 释放相机**，再执行页面给出的采集命令，例如：
+
+```bash
+.venv-lerobot/bin/python -m piper_capture.cli \
+  --config configs/lerobot_v3_two_d435i_tuned.json capture-lerobot --duration 5
+```
+
+采集启动会重新应用 `camera.wrist.sensor_options` 和
+`camera.third_person.sensor_options`；不支持或应用失败会明确报错，不静默忽略。
+实际传感器参数也会写进采集元数据。RGB 分辨率可两台不同，各自深度几何对齐到各自 RGB。
+再次调试已保存的配置时，把 `--config` 和 `--output` 都指定为该文件即可继续保存到同一处。
+
+预览期间相机会被占用，请先结束其他采集/相机预览程序。关闭浏览器页签不会自动释放相机，
+用页面停止按钮或服务终端 `Ctrl-C` 释放。界面只绑定本机 `127.0.0.1`。
