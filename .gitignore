@@ -1,0 +1,21 @@
+# ---- 采集数据与运行日志：体积大，默认不提交 ----
+/dataset/
+/reports/
+*.mp4
+*.bag
+
+# 图像与深度数据（若在数据集之外临时导出）
+rgb/
+depth_raw/
+depth_aligned/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/

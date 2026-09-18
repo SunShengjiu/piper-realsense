@@ -1,0 +1,381 @@
+# PiPER + D435i 数据采集 / 手眼标定 / 数据质检
+
+本目录实现 PiPER 机械臂 + RealSense D435i 的数据采集链路：只读读取机械臂关节反馈、
+保存 RGB-D 帧对、记录时间戳与同步误差、导出驱动记录，并提供手眼标定、夹爪开度校准、
+第三人称视频登记和数据质量检查工具。
+
+**默认全程只读**：除 `gripper probe --allow-motion` 外，所有命令都不下发机械臂或夹爪
+运动指令，不激活/不修改 CAN 配置，不升级固件，不改关节零位。
+
+```
+piper_capture/      Python 包（CLI + 各功能模块）
+docs/               数据字典
+examples/           数据读取示例
+dataset/            数据集根目录（默认；大体积数据不提交 Git）
+```
+
+## 1. 运行环境（已实测）
+
+| 项 | 实测值 |
+| --- | --- |
+| 主机 | Ubuntu 22.04 / Python 3.10.12 |
+| ROS | 未安装（`/opt/ros` 不存在、`ROS_DISTRO` 为空）→ 本项目**不依赖 ROS**，用 `piper_sdk` 直连 socketcan |
+| 机械臂驱动 | `piper_sdk`（`C_PiperInterface_V2`）+ socketcan `can0`，bitrate 1000000 |
+| CAN 适配器 | gs_usb（OpenMoko Geschwister Schneider，`1d50:606f`，USB `3-4:1.0`） |
+| 相机 | RealSense D435i，序列号 `241122071942`，固件 `5.13.0.55`，USB 3.2 |
+| 相机库 | `pyrealsense2` 2.58.4 |
+| 其他依赖 | `opencv-contrib-python-headless` 4.11.0.86、`numpy`、`scipy`、`python-can` |
+| ffmpeg | `/home/robot/.local/bin/ffmpeg`（`shutil.which` 找不到；无 ffprobe，第三人称视频探测以 OpenCV 为主） |
+
+官方参考（只作参考，本项目未直接依赖其 ROS 包）：
+`agilexrobotics/Agilex-College` 的 `piper/handeye`、`agilexrobotics/handeye_calibration_ros`。
+当前环境没有 ROS，官方 ROS 节点不能直接运行，因此标定流程按同样的数学与采样约定
+在本项目内独立实现（`cv2.calibrateHandEye` + `cv2.aruco`）。
+
+### 硬件命令必须在宿主环境运行
+
+CAN 与 USB 相机在受限沙箱/容器内不可见（沙箱网络命名空间会屏蔽 `can0`）。
+`doctor`、`camera-probe --open`、`capture`、`handeye sample`、`gripper diagnose/probe`
+需要在能直接访问 `can0` 和 USB 的宿主 shell 里运行。
+
+## 2. 快速开始
+
+零重力示教的启动、监控、停止、质检与保存路径见
+[数据采集操作步骤](docs/data_collection_guide.md)。
+
+```bash
+cd /home/robot/shucai1
+
+# 1) 环境检查（只读，写 dataset/reports/doctor.json）
+python3 -m piper_capture.cli doctor
+
+# 2) 查询 D435i 支持的流配置并实测帧率
+python3 -m piper_capture.cli camera-probe            # 只列配置
+python3 -m piper_capture.cli camera-probe --open     # 真开相机实测
+
+# 3) 采集一个 episode（默认只读机械臂；Ctrl-C 中断后已完成数据保留）
+python3 -m piper_capture.cli capture --scene scene-tabletop --episode ep-001 --duration 20
+
+# 只采 D435i（机械臂不可用时可用，样本会标 invalid 并给出原因）
+python3 -m piper_capture.cli capture --camera-only --scene scene-tabletop --duration 20
+```
+
+全局参数：`--config <json>`（与默认配置深度合并）、`--dataset-root <dir>`（覆盖数据集根目录）。
+
+### 数采起始姿态
+
+用户约定的“回起始位”：关节 1～6 为 **`[90°, 0°, 0°, 0°, 0°, 0°]`**。
+以现有机械零位为参考，关节 1 正方向是沿基座 +Z 轴从上向下看逆时针；
+这里将用户所述“向左 90°”按此方向保存。机械零位仍为六关节全零。
+配置位于 `piper_capture/config.py` 的 `robot.start_pose`，所有配置文件默认继承。
+新 episode 的 `metadata.json → capture.configured_start_pose` 会记录这一目标，
+它不是实测起始状态；实际姿态以 `samples.jsonl` 的关节反馈为准。
+启动采集不会自动移动机械臂；回起始位是独立的运动操作。
+
+## 3. 命令一览
+
+| 命令 | 作用 |
+| --- | --- |
+| `doctor` | 环境检查：ROS、piper_sdk、RealSense 设备与目标流配置、CAN 接口状态、正运动学三方交叉校验 |
+| `camera-probe [--open] [--seconds N]` | 列出 D435i 支持流配置；`--open` 时实际打开并实测帧率 |
+| `capture [--scene S] [--episode E] [--duration T] [--camera-only] [--verbose]` | 采集一个 episode |
+| `handeye sample --session S` | 手眼标定采样：人工摆姿态，回车记录一帧（不自动规划运动） |
+| `handeye solve --session S [--method M] [--verify-session S2] [--redetect]` | 求解 + 留出验证，写入 `calibrations/handeye/` |
+| `handeye verify --calibration-id ID --session S` | 用指定会话验证已有标定 |
+| `handeye check --session S` | 只检查样本数量、姿态变化、异常样本 |
+| `handeye list` | 列出标定结果与采样会话 |
+| `gripper diagnose [--seconds N]` | 夹爪只读被动诊断（不发命令） |
+| `gripper probe --allow-motion` | 主动探测（**会真实驱动夹爪**） |
+| `gripper calibrate --calibration-id ID --point raw:mm ...` | 保存多点实测开度校准 |
+| `gripper pending` | 输出未校准占位记录与所需测量步骤 |
+| `video add --role R --file F [--scene S] [--episode E] [--reference-only]` | 登记/导入第三人称视频 |
+| `video list` / `video verify [--check-content]` / `video probe --file F` | 列出 / 校验 / 探测视频 |
+| `quality check --episode E` | 单个 episode 的数据质量检查（结论 pass / needs_attention / fail） |
+| `quality dataset` | 整个数据集的质量检查 |
+| `verify-fk [--urdf P]` | 正运动学三方交叉校验（本项目 DH / piper_sdk / 官方 URDF） |
+
+退出码：`0` 成功；`1` 环境或运行失败；`2` 前置条件不满足（标定未通过验证、点数不足、文件不存在、未加 `--allow-motion` 等）。
+
+## 4. 采集语义（重要约定）
+
+- **样本基准是 RGB-D 帧对**，目标 30 样本/秒；机械臂原生反馈以完整频率单独写入
+  `robot_states.jsonl`，不参与降采样。
+- **关节角用实测反馈**（`0.001°` 原始值换算为弧度），顺序固定为 `joint1..joint6`。
+- **EE 位姿由反馈关节角做正运动学得到**（`ee_pose_source: "feedback_joint_fk"`），
+  不用目标关节角，不用相机测量代替。`ee_pose = [x, y, z, qw, qx, qy, qz]`，xyz 单位米，
+  四元数 wxyz、已归一化、已做 q/-q 符号连续性处理。
+- **基站/末端坐标系**：`base_frame=piper_base_link`，`ee_frame=link6`（默认）。
+  `tool_offset_m` 未实测时为全零，来源记为 `unconfigured_default_zero`；法兰/link6/TCP
+  的区别见数据字典。
+- **夹爪是独立字段**，不混入弧度数组：`gripper_feedback_raw`（驱动原始值，单位 0.001 mm）、
+  `gripper_width_mm`（校准后两指实际间距）、`gripper_calibration_id`、`gripper_valid`。
+  未完成物理校准时 `gripper_width_mm` 为 `null` 并写明原因，**不填虚构毫米值**。
+- **时间同步是软件匹配，不是硬件同步**（数据集里显式写 `is_hardware_synchronized: false`）。
+  超过容差的关节状态不会被静默复用：样本标 `invalid` 并计入统计。
+- **PiPER 协议没有设备侧时间戳**，关节反馈只有主机接收时间
+  （`joints_clock_source: "none:piper_can_protocol_has_no_device_timestamp"`）；
+  RealSense 有设备时间戳（`global_time` 域），通过 `DeviceClockMapper` 映射到统一时间轴。
+- **命令与状态分开**：本项目未接入下发命令记录，`commands.jsonl` 会显式写明
+  `command_recording_enabled: false`，不从反馈状态反推命令。
+
+## 5. 手眼标定流程（人工摆姿态）
+
+相机装在末端（官方支架），采用 **eye-in-hand**，求 `T_ee_camera`：
+
+```
+p_ee = T_ee_camera @ p_camera        # p_camera 在 camera_color_optical_frame 下
+```
+
+**当前实物板（用户照片）是 calib.io 棋盘格：8 行×11 列方格、10 列×7 行内角点，标签格长 15 mm。**
+使用专用配置 `configs/handeye_checkerboard_eye_in_hand.json`，启动：
+
+```bash
+bash scripts/handeye_checkerboard.sh he-checker-01
+```
+
+需要实时预览时加 `--preview`；续接已有会话加 `--resume`（棋盘位置、相机安装、
+板参数和机械臂参考系必须与此前保持一致）：
+
+```bash
+bash scripts/handeye_checkerboard.sh he-checker-01 --resume --preview
+```
+
+打开 `http://127.0.0.1:8765`，预览与采样共用相机。页面有记录、删除上一帧、结束采样
+并求解按钮。也可在本机终端记录一帧：
+
+```bash
+curl -X POST -H 'X-Handeye-Local: 1' http://127.0.0.1:8765/record
+```
+
+命令返回“已接收”仅代表操作已排队；是否保存成功、当前样本数以页面状态为准。
+
+先将纸面平整贴在硬板上，再把板固定在桌面；整个采样过程板不能移动。
+照片中的纸张有翘曲和折痕，需处理后再采。用尺测量连续 10 格应为 150 mm，
+也核对另一方向的格长；如果打印缩放了，修改 `handeye.board.square_size_m` 为实测单格边长
+（米），并将 `size_source` 改为 `measured`。当前配置记录 `printed_label_unmeasured`。
+相机应看到完整棋盘和少量外侧白边，每次调整姿态后静止、回车采一帧，建议至少 16 帧，
+绕不同轴改变角度；`q` 保存并求解。程序不会驱动机械臂。
+
+棋盘格用 `findChessboardCornersSB` 检测全部 70 个内角点，再用 `solvePnP` 求位姿，
+手眼求解流程保持一致。程序利用黑白格排列固定原点与坐标方向，防止相机旋转后
+角点顺序翻转；目前支持一奇一偶的内角点数。清晰度、重投影误差和完整入镜检查
+不能代替对纸面平整度与实际格长的现场检查。
+
+以下 ArUco 参数和脚本仅用于官方教程里的单码板，与当前棋盘格配置分别保存。
+
+### 公开官方名义安装值（可作临时参考）
+
+本机还保存了一份来自 AgileX `piper_isaac_sim` 官方 `realsense_mid_stand` URDF、
+并串接 Intel D435/D435i 官方光学坐标系的名义矩阵：
+`configs/official_piper_realsense_mid_stand_nominal.json`。
+它给出 `T_link6_camera_color_optical_frame`，平移约
+`[-73.12, 3.49, 36.25] mm`。文件明确标为 `nominal_unverified` / `valid=false`，
+因为它不是现场手眼采样，且假设打印支架、装配方向和相机机身完全符合官方模型。
+安装到数据集目录：
+
+```bash
+python3 scripts/install_official_nominal_handeye.py
+```
+
+这份值可以让程序记录其来源和坐标变换，但质量报告仍会提示“手眼标定未验证”；
+不能把它改写成 `valid=true` 来冒充实测结果。Z‑Robotics‑Lab 的
+`piper_wrist_camera_calibration.example.json` 同样明确写着 `calibrated=false`，
+且使用 `piper_gripper_base` / `d435_joint` 口径，与当前 `link6` 不同，因此不直接采用。
+
+1. **实测标定板尺寸**并更新配置：`handeye.board.marker_size_m`（当前默认 `0.0677 m`
+   取自官方示例，**必须用卡尺实测后复核**；配置里同时记录 `length_unit: "m"`）。
+   默认板型 `aruco_single`，字典 `DICT_ARUCO_ORIGINAL`、id `582`。`charuco` 尚未实现，
+   配错会直接抛 `ValueError` 而不是静默按单码处理。
+
+   **量哪一段**：`marker_size_m` 是**黑色方框外边缘到对边外边缘**的边长，即
+   `7 × 单模块宽`（`DICT_ARUCO_ORIGINAL` 为 5×5 数据 + 每边 1 模块黑框），
+   **不含外圈白色留白**。已实测确认：渲染 id=582 码（420 px，模块 60 px）时黑像素
+   铺满整张位图，`detectMarkers` 角点落在 `[40,40]→[459,40]`，与黑框外边缘重合。
+   量法：横竖各一次取平均，另量对角线做交叉校验（应 = 边长 × 1.4142）。若误把
+   1 模块白边量进去（9 个模块），尺度偏大 9/7 ≈ 1.29 倍，该比例误差会原样进入
+   `T_ee_camera`。
+
+   **字典必须与实物板一致**：同一个 id 在不同字典下图案完全不同（`DICT_ARUCO_ORIGINAL`
+   是 1024 个 5x5 码，`DICT_4X4_1000` 是 1000 个 4x4 码）。已实测：用
+   `DICT_ARUCO_ORIGINAL` 渲染 id=582 板，配 `DICT_ARUCO_ORIGINAL` 时检出且重投影
+   0.00 px；配 `DICT_4X4_1000` 时**一个码都检测不到**（检测结果里会打印当前字典与
+   期望 id 供核对）。
+
+2. **确认相机固定连杆**：官方 URDF 将末端参考设为 `link6`；你已确认使用官方
+   眼在手上配件，因此配置已填写 `camera.mount.link=link6`。这只确定父连杆，
+   不能替代相机光学坐标系相对连杆的实测外参。
+3. 采样（机械臂静止、标定板检测有效才记录）：
+   ```bash
+   python3 -m piper_capture.cli handeye sample --session he-001
+   ```
+   程序会给出质量提示（是否静止、检测是否有效、姿态是否有变化），回车记录一帧。
+   不自动规划扫描运动，姿态由人工调整。
+4. 求解与验证：
+   ```bash
+   python3 -m piper_capture.cli handeye solve --session he-001
+   ```
+   保存标定图像、关节反馈、正运动学位姿与检测结果，支持 `--redetect` 离线重新计算；
+   多方法对比（TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS）；用未参与求解的留出样本输出
+   可量化误差（位置 RMS/最大偏差 mm、旋转 RMS/最大测地偏差 deg）。
+
+   `handeye.mode` 也支持官方流程中的 `eye_to_hand`。该模式按
+   `agilexrobotics/handeye_calibration_ros` 的实现先把 `T_base_ee` 求逆为
+   `T_ee_base`，输出 `T_base_camera`；默认仍为相机随末端移动的 `eye_in_hand`，输出
+   `T_ee_camera`。两种模式都会要求末端姿态有足够旋转变化，并在独立留出姿态上验证。
+
+   使用官方示例 ArUco 板时，可使用仓库内的配置和脚本：
+   ```bash
+   # 先把 Original ArUco id=582 标定板固定在桌面，并确认相机能看到完整码面
+   ./scripts/handeye_official.sh he-piper-d435i-01
+   ```
+   脚本会先采样，再求解并写入 `dataset/calibrations/handeye/`。每次回车只记录一个
+   已静止姿态；建议至少记录 16 个姿态，位置和绕 X/Y/Z 的旋转都要变化。输出的
+   `transform.name` 是 `T_ee_camera`，父坐标系是 `link6`，子坐标系是
+   `camera_color_optical_frame`。脚本不会用官方 URDF 名义值冒充实测外参。
+
+### 5.1 官方参数与本项目的差异
+
+官方资料核实结果（`Agilex-College` 的 `master` 分支，当前核对提交
+`c2688be41e1bc99a9addd555f237a16bc839d936`；`Piper_ros` 的官方仓库只提供驱动、URDF
+和启动文件，不包含手眼标定结果）：
+
+| 项 | 官方 | 本项目 |
+| --- | --- | --- |
+| 标定流程文档 | `piper/handeye/README.md` | 同左（本项目按同样数学独立实现） |
+| 现成标定数据 | **该目录下只有 README.md，没有任何标定数据/结果文件** | 需现场采样产生 |
+| 标定板 | `marker_id:=582`、`marker_size:=0.0677`、`Original ArUco` 字典 | 配置默认值同左，边长待实测复核 |
+| 求解 | `cv2.calibrateHandEye`（`handeye_calibration_ros`，默认 TSAI） | 同算法，另做多方法对比 + 留出验证 |
+| 末端位姿来源 | 驱动上报的 `/end_pose` | **反馈关节角正运动学 FK**（驱动上报值另存 `driver_end_pose_raw`） |
+| 采样 | 交互回车采样，仅存 JSON 结果 | 样本 + 图像 + 关节反馈全部落盘，可 `--redetect` 复算 |
+| 验证 | 无验证环节 | 留出样本上 `T_base_target` 一致性，输出 mm/deg 误差 |
+
+方向约定一致：官方 eye-in-hand 为 `T_base_cam = T_base_ee × T_ee_cam`，与本项目
+`p_ee = T_ee_camera @ p_camera` 同一含义。
+
+**检测环节的实测校验**：`detect_board` 用 `cv2.SOLVEPNP_ITERATIVE` 求解单码位姿
+（与 OpenCV `cv2.aruco.estimatePoseSingleMarkers` 结果一致）。曾用 `SOLVEPNP_IPPE_SQUARE`，
+实测在**板面正对相机**时退化为非精确解：重投影 RMS 27.15 px、位置误差 4.96 mm
+（板距 0.17 m，约 3%），倾角 ≥0.01 rad 才恢复精确；ITERATIVE 在 0～0.4 rad 倾角下
+重投影 RMS 均为 0.0000 px，故改用 ITERATIVE。
+
+**端到端合成自检**（不接硬件，已知 `T_ee_camera` 真值反渲染标定板图像）：
+24/24 检出，`handeye solve` 结果 `valid`，求解值相对真值平移误差 2.06 mm、
+旋转误差 0.09°，留出验证 位置 RMS 0.73 mm / 旋转 RMS 0.37°。
+
+**状态约定**：没有真实样本或未通过验证时 `status` 只会是 `pending`（样本不足/姿态变化不够）
+或 `invalid`（留出误差超阈值），`transform` 不会出现，**不会用单位矩阵假装标定完成**。
+标定结果记录 `parent_frame`、`child_frame`、平移单位、矩阵方向、相机使用 RGB 光学坐标系
+（`camera_color_optical_frame`）、算法、依赖版本与采样时间。
+
+## 6. 夹爪诊断与开度校准
+
+```bash
+# 只读诊断：不发送任何夹爪命令
+python3 -m piper_capture.cli --dataset-root dataset gripper diagnose --seconds 10
+```
+
+诊断内容：原始值范围与量纲核对（配置 `raw_unit_mm=0.001`、标称行程 `[0, 70] mm`）、
+`status_code` 位（bit6 使能 / bit5 驱动错误 / bit4 传感器异常 / bit7 回零）、
+扭矩是否接近堵转、夹爪反馈更新率与间隔。**没有持续反馈时会明确报 blocker**，
+并且不会把默认值 0 当作实测行程/使能状态。
+
+开度校准（需要游标卡尺实物测量）：
+
+```bash
+python3 -m piper_capture.cli gripper calibrate --calibration-id grip-v1 \
+  --point 0:25.3 --point 20000:38.1 --point 40000:51.0 --point 60000:64.2
+```
+
+输出线性拟合（`width_mm = slope * raw + intercept`）、残差 RMS/最大偏差/标准误、
+单位自检（斜率与 0.001 的比值，用于发现把单侧行程当总行程，比值≈0.5）、覆盖范围警告。
+少于 3 个点或原始值重复会直接报 `ValueError`。
+未完成测量时用 `gripper pending` 输出占位记录与测量步骤（`valid: false`）。
+
+## 7. 第三人称视频（只做导入与登记）
+
+```bash
+# 侧视任务视频：按 episode 关联
+python3 -m piper_capture.cli video add --role side_task --episode ep-001 --file /path/side.mp4
+
+# 环境环视视频：按 scene 保存，可被多个 episode 引用
+python3 -m piper_capture.cli video add --role environment_overview --scene scene-tabletop --file /path/env.mp4
+
+python3 -m piper_capture.cli video list
+python3 -m piper_capture.cli video verify --check-content
+```
+
+记录文件路径、角色、分辨率、帧率、时长、`scene_id`、`episode_id`、sha256 校验值，
+以及可获得的录制时间、时间偏移、同步状态。**没有同步依据时标 `unsynchronized`，
+不伪造时间对齐**，也不要求与机械臂样本一一对应。未导入第三人称视频时，
+机械臂与 D435i 仍可独立采集。
+
+## 8. 数据目录与质检
+
+目录结构与字段见 [docs/data_dictionary.md](docs/data_dictionary.md)。
+
+```bash
+python3 -m piper_capture.cli quality check --episode ep-001
+python3 -m piper_capture.cli quality dataset
+```
+
+检查项包括：JSONL 可解析性、图像文件存在且尺寸一致、深度为 uint16、对齐深度与 RGB 同尺寸、
+几何对齐声明、无效深度语义、实测帧率与丢帧、同步误差与过期反馈、标定文件存在性、
+是否把软件匹配描述成硬件同步等。结论为 `pass` / `needs_attention` / `fail`，
+报告写入 `<episode>/quality_report.json`。
+
+数据集整体可搬移：所有路径都相对 `manifest.json` 所在目录记录。
+
+## 9. CAN 链路注意事项（已定位过的真实故障）
+
+### 9.1 曾出现的"总线完全静默"根因：**USB-CAN 适配器 USB 通路故障，不是机械臂**
+
+2026-09-18 排查结论（`ip` + syslog + 被动监听）：
+
+- 现象：`can0` 显示 UP / ERROR-ACTIVE / 错误计数全 0，但被动监听 0 帧，
+  `piper_sdk` 读到 `time_stamp: 0`、关节全 0、`enable` 全 False。
+- 根因：candleLight 适配器（`1d50:606f`）USB 数据通路已死 —— 发送返回
+  `ENOBUFS: No buffer space available (105)`，syslog 记录 6 次 `USB disconnect`、
+  5 次重枚举、6 次 `Error -71 while reading timestamp`、1 次
+  `gs_usb: failed to set bittiming: -EPROTO`。
+- **关键教训**：USB 通路死掉时内核不会再向适配器发起事务，`can0` 的
+  `ERROR-ACTIVE` 与全 0 错误计数是**过期状态**，不能作为"链路正常"或"机械臂正常"的依据。
+- 处理：把适配器换到主板直连的另一个 USB 口（`3-4` → `3-6`），并重新激活 `can0`。
+  换口后总线恢复：`0x251`–`0x256`、`0x261`–`0x266`、`0x2A1`–`0x2A8` 全部正常，
+  关节反馈 200 Hz、夹爪反馈 200 Hz。
+
+该适配器为 **USB 总线供电（MaxPower 150 mA）**，对线材与 EMI 敏感。若再次出现
+`-71` / `EPROTO` / `ENOBUFS` / 反复重枚举，优先查 USB 线材、接口与电机线缆干扰，
+而不是怀疑机械臂。
+
+### 9.2 每次重插适配器后必须重新激活
+
+`can0` 是 NetworkManager 的 `unmanaged` 设备，**没有任何服务自动激活**：
+重插 USB 后接口会以 DOWN/STOPPED 重建，必须人工激活（需 root，本项目不代为执行）：
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+# 或
+bash /home/robot/mujoco/piper_ros/can_activate.sh can0 1000000
+```
+
+### 9.3 反馈帧率实测（`can0` 正常时）
+
+| CAN ID | 内容 | 实测频率 |
+| --- | --- | --- |
+| `0x251`–`0x256` | 关节相关 | 200 Hz |
+| `0x261`–`0x266` | 关节相关 | 40 Hz |
+| `0x2A1`–`0x2A8` | 状态/末端位姿/关节反馈/夹爪反馈 | 200 Hz |
+| 合计 | | ≈ 3040 帧/秒 |
+
+### 9.4 夹爪"发指令后开合不稳定"的实测证据
+
+只读诊断（`gripper diagnose`，全程未下发任何指令）实测：
+
+- 夹爪原始反馈**恒为 `-3220`**（按 `0.001 mm` 换算约 −3.22 mm，为负值，超出
+  `[0, 70] mm` 标称行程对应的 `[0, 70000]` 原始范围），整段窗口数值不变；
+- `status_code` 恒为 **0**：所有错误位为 0，但 **bit6 使能位 = 0（驱动未使能）**、
+  **bit7 回零位 = 0（未做过回零/set_zero）**。
+
+即：**驱动器从未使能、也从未回零**。官方流程是先发 `status_code = 0x01` 使能再发
+行程指令；未使能时行程指令不会正常执行，表现为"发了指令但开合不稳定/无响应"。
+`gripper calibrate` 需要的多点实测开度仍然缺失，`gripper_width_mm` 保持为 `null`。

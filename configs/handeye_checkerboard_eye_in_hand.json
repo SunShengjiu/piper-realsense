@@ -1,0 +1,35 @@
+{
+  "robot": {
+    "can_interface": "can0",
+    "base_frame": "piper_base_link",
+    "ee_frame": "link6",
+    "tool_offset_m": [0.0, 0.0, 0.0]
+  },
+  "camera": {
+    "serial": "241122071942",
+    "mount": {
+      "link": "link6",
+      "source": "user_confirmed_eye_in_hand_official_accessories",
+      "note": "用户确认眼在手上；以 link6 为求解参考"
+    }
+  },
+  "handeye": {
+    "calibration_id": "handeye-official-piper-realsense-mid-stand-nominal",
+    "calibration_source": "official_nominal_unverified",
+    "mode": "eye_in_hand",
+    "ee_frame_for_solve": "link6",
+    "camera_optical_frame": "camera_color_optical_frame",
+    "board": {
+      "type": "checkerboard",
+      "inner_corners": [10, 7],
+      "square_size_m": 0.015,
+      "dictionary": null,
+      "marker_id": null,
+      "marker_size_m": null,
+      "length_unit": "m",
+      "size_source": "printed_label_unmeasured",
+      "source": "user_board_photo_calib.io_8x11_checker_15mm",
+      "note": "用户照片标签为 8 行×11 列方格，内角点为 10 列×7 行，格长 15 mm；打印比例待实测，棋盘须平整固定"
+    }
+  }
+}

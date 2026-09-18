@@ -1,0 +1,31 @@
+{
+  "robot": {
+    "can_interface": "can0",
+    "base_frame": "piper_base_link",
+    "ee_frame": "link6",
+    "tool_offset_m": [0.0, 0.0, 0.0]
+  },
+  "camera": {
+    "serial": "241122071942",
+    "mount": {
+      "link": "link6",
+      "source": "user_confirmed_eye_in_hand_official_accessories",
+      "note": "用户确认眼在手上；固定连杆按官方 URDF link6 配置"
+    }
+  },
+  "handeye": {
+    "calibration_id": "handeye-official-piper-realsense-mid-stand-nominal",
+    "calibration_source": "official_nominal_unverified",
+    "mode": "eye_in_hand",
+    "ee_frame_for_solve": "link6",
+    "camera_optical_frame": "camera_color_optical_frame",
+    "board": {
+      "type": "aruco_single",
+      "dictionary": "DICT_ARUCO_ORIGINAL",
+      "marker_id": 582,
+      "marker_size_m": 0.0677,
+      "size_source": "official_example_unmeasured",
+      "length_unit": "m"
+    }
+  }
+}

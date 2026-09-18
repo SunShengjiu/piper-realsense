@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "handeye",
+  "calibration_id": "handeye-official-piper-realsense-mid-stand-nominal",
+  "status": "nominal_unverified",
+  "valid": false,
+  "mode": "eye_in_hand",
+  "transform": {
+    "name": "T_ee_camera",
+    "semantics": "p_ee = T_ee_camera @ p_camera",
+    "parent_frame": "link6",
+    "child_frame": "camera_color_optical_frame",
+    "matrix_row_major": [
+      [0.000792589819, 0.939114839470, 0.343602517583, -0.073123626446],
+      [-0.999999685895, 0.000743183979, 0.000275476639, 0.003493935707],
+      [0.000003344313, -0.343602627996, 0.939115133529, 0.036246655884],
+      [0.0, 0.0, 0.0, 1.0]
+    ],
+    "translation_m": [-0.073123626446, 0.003493935707, 0.036246655884],
+    "translation_unit": "m",
+    "matrix_direction": "p_parent = T_parent_child @ p_child",
+    "camera_optical_frame_convention": "camera_color_optical_frame: +x right, +y down, +z forward",
+    "camera_stream_used": "color (RGB)"
+  },
+  "provenance": {
+    "source_type": "official_CAD_URDF_composition",
+    "source_url": "https://github.com/agilexrobotics/piper_isaac_sim/blob/8e1f88fdb7afca49c40e9a0c1c01cc588e86f0d2/piper_description/urdf/piper_description_v100_realsense_camera_v2.urdf",
+    "source_commit": "8e1f88fdb7afca49c40e9a0c1c01cc588e86f0d2",
+    "source_file_sha256": "d21046ed1614b8077ce00b5309beae4fa4fbc7d3b654c3f500c815deec90d287",
+    "applicable_mount": "piper_link6_realsense_mid_stand",
+    "official_mount_transform": {
+      "parent_frame": "link6",
+      "child_frame": "camera_bottom_screw_frame",
+      "xyz_m": [-0.065001118470, -0.028999684337, 0.021997111309],
+      "source": "AgileX piper_isaac_sim d435_camera_joint with piper_ros link6 frame conversion"
+    },
+    "factory_optical_transform": {
+      "parent_frame": "camera_bottom_screw_frame",
+      "child_frame": "camera_color_optical_frame",
+      "xyz_m": [0.0106, 0.0325, 0.0125],
+      "source": "Intel RealSense D435/D435i _d435.urdf.xacro"
+    },
+    "warning": "This is nominal CAD/URDF composition, not a measured hand-eye calibration. It assumes the physical mount exactly matches the official realsense_mid_stand and does not account for print, assembly, camera serial, or compliance error. Do not use as validated grasp-planning extrinsics without independent verification."
+  },
+  "verification": {
+    "hand_eye_calibration_used": false,
+    "measured_samples": 0,
+    "status_reason": "official_nominal_only"
+  }
+}
