@@ -321,11 +321,6 @@ class RealsenseCamera:
         self._profile = self._pipeline.start(cfg)
         self._align = rs.align(rs.stream.color)
         from .camera_options import apply_options, saved_options
-        try:
-            apply_options(self._profile.get_device(), rs, self.sensor_options)
-        except Exception:
-            self.close()
-            raise
 
         actual = self._collect_actual_streams()
         mismatch = self._spec_mismatch(actual)
@@ -345,6 +340,18 @@ class RealsenseCamera:
         if mismatch:
             warnings.append("规格不符但已按配置允许降级: " + "; ".join(mismatch))
 
+        # Some D435i firmware resets color exposure during the first frames after
+        # pipeline start.  Apply configured options after warmup/priming so a
+        # manual RGB exposure remains effective for the captured frames.
+        for _ in range(max(0, self.warmup_frames)):
+            self._pipeline.wait_for_frames(self.frame_timeout_ms)
+        self._prime_aligned_pair()
+        try:
+            apply_options(self._profile.get_device(), rs, self.sensor_options)
+        except Exception:
+            self.close()
+            raise
+
         self.model = CameraModel(
             serial=serial,
             firmware_version=firmware,
@@ -361,9 +368,6 @@ class RealsenseCamera:
             warnings=warnings,
             sensor_options=saved_options(self._profile.get_device(), rs),
         )
-        for _ in range(max(0, self.warmup_frames)):
-            self._pipeline.wait_for_frames(self.frame_timeout_ms)
-        self._prime_aligned_pair()
         return self.model
 
     def _prime_aligned_pair(self, tolerance_ms: float = 10.0, max_frames: int = 45) -> int:

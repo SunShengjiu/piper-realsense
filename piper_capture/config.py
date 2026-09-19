@@ -1,7 +1,8 @@
 """运行配置。
 
-默认值都能在“没有实物标定”的前提下安全运行：只读、不发送运动指令、
-不把未标定的量填成数字。实物相关字段留空时下游必须写 null 并给出原因。
+默认值都能在“没有实物标定”的前提下安全运行：采集仍然只读、不发送运动指令、
+不把未标定的量填成数字。回零属于显式开启的运动功能；它只移动到目标姿态，
+不会改写电机的持久化零点。
 """
 from __future__ import annotations
 
@@ -25,7 +26,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "poll_hz": 200.0,
         # 只读：PiPER 协议无设备侧时间戳，关节反馈只有主机接收时刻
         "read_only": True,
-        "command_interface": {"available": False, "note": "本项目未接入下发命令记录"},
+        "command_interface": {
+            "available": False,
+            "note": "采集状态不记录下发命令；显式 robot/motion 回零流程单独开启",
+        },
         "feedback_timeout_s": 1.0,
         "ee_frame": "link6",
         "base_frame": "piper_base_link",
@@ -38,6 +42,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "direction_convention": "joint1 positive: counterclockwise viewed from above base +Z toward origin",
             "source": "user_requested_joint1_left_90_degrees",
             "auto_move_on_capture": False,
+        },
+        # 运动工作流的目标姿态。这里的“零位”表示六关节角度为 0° 的目标，
+        # 不是调用 JointConfig 设置新的电机零点。
+        "return_pose": {
+            "name": "robot_joint_zero",
+            "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+            "joint_positions_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "reference": "existing_robot_joint_zero",
+            "source": "piper_sdk_joint_control_target",
+        },
+        "motion": {
+            # 保持 false：普通采集命令仍只读。交互命令的
+            # --arm-button-return-zero 会显式开启同一功能。
+            "return_to_zero_on_arm_button": False,
+            "speed_percent": 20,
+            "command_hz": 100.0,
+            "timeout_s": 20.0,
+            "enable_timeout_s": 3.0,
+            "tolerance_deg": 1.0,
+            "settle_s": 0.5,
+            # Only the explicit arm-button workflow may reset a teaching-mode
+            # controller to standby before selecting CAN.
+            "reset_teaching": False,
+            "reset_timeout_s": 3.0,
         },
         # 官方 URDF，用于 FK 三方交叉校验（存在才校验）
         "urdf_path": "/home/robot/codeaspolicy/src/robot_pick_place_agent/assets/piper/upstream/piper_description.urdf",

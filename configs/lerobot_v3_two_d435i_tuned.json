@@ -19,11 +19,22 @@
         }
       },
       "sensor_options": {
+        "depth": {
+          "enable_auto_exposure": 1.0,
+          "visual_preset": 0.0,
+          "emitter_enabled": 1.0,
+          "laser_power": 150.0,
+          "auto_exposure_limit_toggle": 0.0,
+          "auto_gain_limit_toggle": 0.0,
+          "emitter_on_off": 0.0,
+          "emitter_always_on": 0.0
+        },
         "color": {
           "enable_auto_exposure": 0.0,
-          "exposure": 1000.0,
+          "exposure": 500.0,
           "gain": 0.0,
-          "enable_auto_white_balance": 1.0,
+          "enable_auto_white_balance": 0.0,
+          "white_balance": 6150.0,
           "brightness": 0.0,
           "contrast": 50.0,
           "saturation": 64.0,
@@ -54,11 +65,22 @@
         }
       },
       "sensor_options": {
+        "depth": {
+          "enable_auto_exposure": 1.0,
+          "visual_preset": 0.0,
+          "emitter_enabled": 1.0,
+          "laser_power": 150.0,
+          "auto_exposure_limit_toggle": 0.0,
+          "auto_gain_limit_toggle": 0.0,
+          "emitter_on_off": 0.0,
+          "emitter_always_on": 0.0
+        },
         "color": {
           "enable_auto_exposure": 0.0,
-          "exposure": 1000.0,
+          "exposure": 500.0,
           "gain": 0.0,
-          "enable_auto_white_balance": 1.0,
+          "enable_auto_white_balance": 0.0,
+          "white_balance": 6200.0,
           "brightness": 0.0,
           "contrast": 50.0,
           "saturation": 64.0,

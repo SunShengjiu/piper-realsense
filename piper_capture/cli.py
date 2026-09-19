@@ -6,11 +6,14 @@
     python3 -m piper_capture.cli handeye sample --session he-001
     python3 -m piper_capture.cli handeye solve --session he-001
     python3 -m piper_capture.cli gripper diagnose --seconds 10
+    python3 -m piper_capture.cli robot go-zero --allow-motion --wait-for-button
     python3 -m piper_capture.cli video add --role side_task --episode <id> --file a.mp4
     python3 -m piper_capture.cli quality check --episode <id>
     python3 -m piper_capture.cli verify-fk
 
-所有命令默认只读；只有 `gripper probe --allow-motion` 会真实驱动夹爪。
+所有命令默认只读；只有显式的运动选项（`--arm-button-return-zero` 或
+`robot go-zero --allow-motion`）会真实驱动机械臂，`gripper probe --allow-motion`
+会真实驱动夹爪。
 """
 from __future__ import annotations
 
@@ -349,7 +352,20 @@ def cmd_capture_lerobot(args: argparse.Namespace) -> int:
     from .lerobot_writer import LeRobotCaptureSession
 
     cfg = _cfg(args)
-    session = LeRobotCaptureSession(cfg, base_dir=Path.cwd(), duration_s=args.duration, task=args.task)
+    arm_button_return_zero = bool(getattr(args, "arm_button_return_zero", False))
+    return_on_q = bool(getattr(args, "return_on_q", False) or arm_button_return_zero)
+    target_deg = getattr(args, "target_deg", None)
+    if return_on_q and target_deg is None:
+        target_deg = cfg.get("robot", {}).get("start_pose", {}).get("joint_positions_deg")
+    session = LeRobotCaptureSession(
+        cfg,
+        base_dir=Path.cwd(),
+        duration_s=args.duration,
+        task=args.task,
+        arm_button_return_zero=arm_button_return_zero,
+        return_on_q=return_on_q,
+        return_pose_deg=target_deg,
+    )
     summary = session.run()
     _print(summary)
     return 0 if summary.get("status") in ("closed", "aborted") else 1
@@ -358,12 +374,100 @@ def cmd_capture_lerobot(args: argparse.Namespace) -> int:
 def cmd_capture_lerobot_interactive(args: argparse.Namespace) -> int:
     from .interactive_capture import run_interactive
 
+    cfg = _cfg(args)
+    arm_button_return_zero = bool(getattr(args, "arm_button_return_zero", False))
+    return_on_q = bool(getattr(args, "return_on_q", False) or arm_button_return_zero)
+    target_deg = getattr(args, "target_deg", None)
+    if return_on_q and target_deg is None:
+        target_deg = cfg.get("robot", {}).get("start_pose", {}).get("joint_positions_deg")
     return run_interactive(
         config=args.config,
         dataset_root=args.dataset_root,
         task=args.task,
         episodes=args.episodes,
+        arm_button_return_zero=arm_button_return_zero,
+        return_on_q=return_on_q,
+        target_deg=target_deg,
     )
+
+
+def cmd_robot(args: argparse.Namespace) -> int:
+    """Explicit, bounded robot motion commands."""
+
+    if args.sub != "go-zero":
+        raise SystemExit("未知 robot 子命令")
+    if not args.allow_motion:
+        raise ValueError("robot go-zero 会真实驱动机械臂；请显式添加 --allow-motion")
+
+    from piper_sdk import C_PiperInterface_V2
+    from .motion import PiperMotionController, validate_target_pose
+
+    cfg = _cfg(args)
+    robot_cfg = cfg["robot"]
+    raw_motion_cfg = dict(robot_cfg.get("motion", {}))
+    motion_cfg = {
+        key: raw_motion_cfg[key]
+        for key in (
+            "speed_percent",
+            "command_hz",
+            "timeout_s",
+            "enable_timeout_s",
+            "tolerance_deg",
+            "settle_s",
+            "reset_teaching",
+            "reset_timeout_s",
+        )
+        if key in raw_motion_cfg
+    }
+    if args.speed_percent is not None:
+        motion_cfg["speed_percent"] = args.speed_percent
+    if args.timeout_s is not None:
+        motion_cfg["timeout_s"] = args.timeout_s
+    if args.tolerance_deg is not None:
+        motion_cfg["tolerance_deg"] = args.tolerance_deg
+    # The physical J6 teaching button only ends recording and leaves the arm
+    # in ctrl_mode=0x02.  A wait-for-button run therefore needs the documented
+    # reset-to-standby -> CAN handoff before it can send JointCtrl frames.
+    if args.wait_for_button or args.reset_teaching:
+        motion_cfg["reset_teaching"] = True
+    target = validate_target_pose(
+        args.target_deg or robot_cfg.get("return_pose", {}).get("joint_positions_deg", [0.0] * 6)
+    )
+
+    piper = None
+    try:
+        piper = C_PiperInterface_V2(
+            can_name=robot_cfg["can_interface"],
+            judge_flag=True,
+            can_auto_init=True,
+            dh_is_offset=0x01 if int(robot_cfg["dh_is_offset"]) else 0x00,
+            start_sdk_joint_limit=bool(robot_cfg.get("sdk_joint_limit", False)),
+            start_sdk_gripper_limit=bool(robot_cfg.get("sdk_gripper_limit", False)),
+            logger_level=40,
+        )
+        piper.ConnectPort(can_init=True, piper_init=True, start_thread=True)
+        controller = PiperMotionController(piper, target_deg=target, **motion_cfg)
+        if args.wait_for_button:
+            print(
+                "等待机械臂示教按钮结束记录；请单击 J5/J6 之间的示教按钮。"
+                "结束后程序会重置到待机、切换 CAN 并回位。",
+                file=sys.stderr,
+                flush=True,
+            )
+            trigger = controller.wait_for_teach_button(timeout_s=args.wait_timeout_s)
+        else:
+            trigger = None
+        result = controller.move_to_target()
+        output = result.to_dict()
+        output["button_trigger"] = trigger
+        _print(output)
+        return 0 if result.status == "success" else 1
+    finally:
+        if piper is not None:
+            try:
+                piper.DisconnectPort()
+            except Exception:
+                pass
 
 
 def cmd_camera_ui(args: argparse.Namespace) -> int:
@@ -623,20 +727,70 @@ def build_parser() -> argparse.ArgumentParser:
     lc = sub.add_parser("capture-lerobot", help="两台 D435i + PiPER 直接写 LeRobotDataset v3")
     lc.add_argument("--duration", type=float, default=None, help="秒；不指定则持续到 Ctrl-C")
     lc.add_argument("--task", default="piper observation")
+    lc.add_argument(
+        "--arm-button-return-zero",
+        action="store_true",
+        help="检测示教按钮结束记录，退出示教并在保存后回到六关节 0°",
+    )
+    lc.add_argument(
+        "--return-on-q",
+        action="store_true",
+        help="按 q 结束 episode 后自动回到配置的采集初始位姿",
+    )
+    lc.add_argument(
+        "--target-deg", type=float, nargs=6, default=None, metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="回位目标关节角（度）；--return-on-q 默认使用采集初始位姿，否则使用配置回位目标",
+    )
     lc.set_defaults(func=cmd_capture_lerobot)
 
     li = sub.add_parser(
         "capture-lerobot-interactive",
-        help="交互采集：按空格开始 episode，按 q 结束并保存",
+        help="交互采集：按空格开始；按 q 或可选的机械臂按钮结束并保存",
     )
     li.add_argument("--episodes", type=int, default=None, help="完成指定数量后退出；默认持续到 Ctrl-C")
     li.add_argument("--task", default="piper observation")
+    li.add_argument(
+        "--arm-button-return-zero",
+        action="store_true",
+        help="机械臂示教按钮结束当前 episode，保存后退出示教并自动回到六关节 0°",
+    )
+    li.add_argument(
+        "--return-on-q",
+        action="store_true",
+        help="按 q 结束 episode 后自动回到配置的采集初始位姿",
+    )
+    li.add_argument(
+        "--target-deg", type=float, nargs=6, default=None, metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="回位目标关节角（度）；--return-on-q 默认使用采集初始位姿，否则使用配置回位目标",
+    )
     li.set_defaults(func=cmd_capture_lerobot_interactive)
 
     lv = sub.add_parser("verify-lerobot", help="官方 LeRobotDataset 重新加载并检查字段")
     lv.add_argument("--root", required=True)
     lv.add_argument("--repo-id", default="piper_two_d435i")
     lv.set_defaults(func=cmd_verify_lerobot)
+
+    r = sub.add_parser("robot", help="显式机械臂运动命令（默认仍只读）")
+    rsub = r.add_subparsers(dest="sub", required=True)
+    rz = rsub.add_parser("go-zero", help="在 CAN 模式下移动到配置目标姿态，不改写电机零点")
+    rz.add_argument("--allow-motion", action="store_true", help="必须显式确认会真实驱动机械臂")
+    rz.add_argument(
+        "--wait-for-button", action="store_true",
+        help="先等待示教按钮结束记录；随后重置到待机、切 CAN 并回位",
+    )
+    rz.add_argument(
+        "--reset-teaching", action="store_true",
+        help="允许从示教模式发送 ResetPiper（可能短暂失电）；随后切 CAN",
+    )
+    rz.add_argument("--wait-timeout-s", type=float, default=60.0)
+    rz.add_argument("--speed-percent", type=int, default=None, help="速度百分比 1..100，默认配置值")
+    rz.add_argument("--timeout-s", type=float, default=None, help="回零超时，默认配置值")
+    rz.add_argument("--tolerance-deg", type=float, default=None, help="到位误差阈值，默认配置值")
+    rz.add_argument(
+        "--target-deg", type=float, nargs=6, default=None, metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="目标关节角（度），默认配置中的六关节 0°",
+    )
+    rz.set_defaults(func=cmd_robot)
 
     h = sub.add_parser("handeye", help="手眼标定")
     hsub = h.add_subparsers(dest="sub", required=True)

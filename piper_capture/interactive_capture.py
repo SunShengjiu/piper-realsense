@@ -1,9 +1,9 @@
 """Keyboard-driven LeRobot capture loop.
 
-The normal capture command uses SIGINT to finish one episode.  This wrapper
+The normal capture command uses a signal to finish one episode.  This wrapper
 keeps one terminal session open: press Space to start an episode and ``q`` to
-finish it.  The child capture process receives SIGINT so its normal cleanup and
-video finalization still run.
+finish it.  When return-on-q is enabled, the child receives SIGUSR1 so cleanup
+can distinguish q from Ctrl-C and run the configured return motion.
 """
 from __future__ import annotations
 
@@ -31,6 +31,9 @@ def run_interactive(
     dataset_root: Optional[str],
     task: str,
     episodes: Optional[int],
+    arm_button_return_zero: bool = False,
+    return_on_q: bool = False,
+    target_deg: Optional[list[float]] = None,
 ) -> int:
     if not sys.stdin.isatty():
         raise RuntimeError("交互采集需要在终端中运行，不能从管道输入")
@@ -41,13 +44,27 @@ def run_interactive(
     if dataset_root:
         command.extend(["--dataset-root", dataset_root])
     command.extend(["capture-lerobot", "--task", task])
+    if arm_button_return_zero:
+        command.append("--arm-button-return-zero")
+    if return_on_q:
+        command.append("--return-on-q")
+    if target_deg is not None:
+        command.extend(["--target-deg", *[str(v) for v in target_deg]])
+    target_text = "[" + ", ".join(str(v) for v in (target_deg or [0, 0, 0, 0, 0, 0])) + "]°"
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     completed = 0
     try:
         tty.setcbreak(fd)
-        print("\n交互采集已就绪：按空格开始一个 episode，按 q 结束当前 episode。", flush=True)
+        if arm_button_return_zero or return_on_q:
+            print(
+                "\n交互采集已就绪：按空格开始；每条采集按 q 结束后，"
+                f"程序会保存 episode、退出示教并回到 {target_text}。",
+                flush=True,
+            )
+        else:
+            print("\n交互采集已就绪：按空格开始一个 episode，按 q 结束当前 episode。", flush=True)
         print("在等待下一次开始时按 Ctrl-C 退出。", flush=True)
         while episodes is None or completed < episodes:
             print(f"\n等待开始（已完成 {completed} 个）...", flush=True)
@@ -59,7 +76,10 @@ def run_interactive(
                     print("已退出交互采集。", flush=True)
                     return 0
 
-            print("已开始当前 episode；场景完成后按 q。", flush=True)
+            if arm_button_return_zero or return_on_q:
+                print("已开始当前 episode；完成示教后按 q，程序保存并自动回到初始位姿。", flush=True)
+            else:
+                print("已开始当前 episode；场景完成后按 q。", flush=True)
             child = subprocess.Popen(command, stdin=subprocess.DEVNULL)
             q_sent = False
             try:
@@ -67,7 +87,10 @@ def run_interactive(
                     key = _read_key(fd)
                     if key == "q":
                         print("正在结束当前 episode，请等待视频写入完成...", flush=True)
-                        child.send_signal(signal.SIGINT)
+                        if return_on_q and hasattr(signal, "SIGUSR1"):
+                            child.send_signal(signal.SIGUSR1)
+                        else:
+                            child.send_signal(signal.SIGINT)
                         q_sent = True
                         break
                     if key == "\x03":

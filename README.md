@@ -4,8 +4,10 @@
 保存 RGB-D 帧对、记录时间戳与同步误差、导出驱动记录，并提供手眼标定、夹爪开度校准、
 第三人称视频登记和数据质量检查工具。
 
-**默认全程只读**：除 `gripper probe --allow-motion` 外，所有命令都不下发机械臂或夹爪
-运动指令，不激活/不修改 CAN 配置，不升级固件，不改关节零位。
+**默认全程只读**：普通采集、诊断和标定命令都不下发机械臂或夹爪运动指令，不激活/不修改
+CAN 配置，不升级固件，不改关节零位。只有显式加入 `--arm-button-return-zero`，或运行
+`robot go-zero --allow-motion`，程序才会驱动机械臂；`gripper probe --allow-motion`
+仍是唯一的夹爪主动探测入口。
 
 ```
 piper_capture/      Python 包（CLI + 各功能模块）
@@ -22,17 +24,46 @@ dataset/            数据集根目录（默认；大体积数据不提交 Git�
 cd /home/robot/shucai1
 .venv-lerobot/bin/python -m piper_capture.cli \
   --config configs/lerobot_v3_two_d435i_150ep.json \
-  capture-lerobot-interactive --episodes 150
+  capture-lerobot-interactive --episodes 150 --return-on-q
 ```
 
 1. 开始前确认两台相机和机械臂连接正常，并停止调参页面的预览。
 2. 摆好场景，**按空格**。等待“开始采集”和“已写入 … 样本”后进行演示。
-3. 演示结束，**按英文小写 `q`**，等待“当前 episode 已保存”和“等待开始”。
-4. **保存完成后再换场景**，按空格采集下一条，无需重复输入命令。
+3. 演示结束，按 `q` 结束当前 episode。程序先完成视频/数据保存，再按“重置到待机 → CAN”
+   流程，以限速把六个关节移动到配置的采集初始位姿 `[90, 0, 0, 0, 0, 0]°`。
+4. 看到“当前 episode 已保存，机械臂已回到配置初始位姿”后再换场景，按空格采集下一条。
 5. 提前结束本轮，在“等待开始”时按 Ctrl-C；下次运行可继续追加。
 
-按键无需回车，终端需要保持输入焦点。不要先换场景再按 `q`。
+按键无需回车，终端需要保持输入焦点。启用自动回位后，`q` 是每条 episode 的结束键；
+程序会在显式运动工作流中完成示教退出和 CAN 切换。
 `--episodes 150` 指本次运行成功新增 150 条；若已有 40 条、目标总共 150 条，下次用 `--episodes 110`。
+
+### 按机械臂按钮结束并自动回零
+
+`--return-on-q` 监听交互终端的 `q` 结束事件；`--arm-button-return-zero` 还兼容 PiPER
+示教按钮。按钮流程监听 PiPER 状态反馈中的示教记录停止（`teach_status=0x02` 或
+`arm_status: 0x0B -> 正常`），也兼容上位机直接发出的示教→CAN切换。按钮触发后，程序
+先发送官方要求的 `ResetPiper` 进入待机，再选择 CAN 控制模式，最后用
+`MotionCtrl_2 + JointCtrl` 回位。默认速度 20%，到位误差阈值 ±1°，超时 20 秒；检测到
+状态异常、模式离开或超时会停止发目标并报告失败。回零完成后仍保持 CAN 模式。
+
+这里的“回零”是**移动到六关节角度 0° 的目标姿态**，不会调用 `JointConfig(set_zero=0xAE)`，
+因此不会修改机械臂持久化的电机零点。自定义目标可以加到命令末尾，例如：
+
+```bash
+--target-deg 90 0 0 0 0 0
+```
+
+需要单独测试回零时，确认机械臂周围无人、急停可用，再运行：
+
+```bash
+.venv-lerobot/bin/python -m piper_capture.cli \
+  --config configs/lerobot_v3_two_d435i_150ep.json \
+  robot go-zero --allow-motion --wait-for-button
+```
+
+这个独立命令等待示教按钮结束记录，并会执行重置到待机和 CAN 切换；不加 `--allow-motion`
+时只会拒绝执行。`ResetPiper` 可能短暂释放电机使能，执行前应确认机械臂有支撑且急停可用。
 
 数据路径：`/home/robot/shucai1/dataset/lerobot_v3_150ep/`，包含 `meta/`、`data/`、`videos/`。
 一个 episode 不是一帧，也不是一个独立目录；总条数见 `meta/info.json` 的 `total_episodes`。
@@ -107,8 +138,9 @@ python3 -m piper_capture.cli capture --camera-only --scene scene-tabletop --dura
 | `doctor` | 环境检查：ROS、piper_sdk、RealSense 设备与目标流配置、CAN 接口状态、正运动学三方交叉校验 |
 | `camera-probe [--open] [--seconds N]` | 列出 D435i 支持流配置；`--open` 时实际打开并实测帧率 |
 | `capture [--scene S] [--episode E] [--duration T] [--camera-only] [--verbose]` | 旧版 PNG/JSONL 格式采集一个 episode |
-| `capture-lerobot-interactive [--episodes N]` | 空格开始、q 保存当前 episode，连续追加 LeRobot 数据 |
-| `capture-lerobot [--duration T]` | 单条 LeRobot 采集；不指定时长则 Ctrl-C 保存退出 |
+| `capture-lerobot-interactive [--episodes N] [--return-on-q]` | 空格开始；按 q 结束并自动回到采集初始位姿 |
+| `capture-lerobot [--duration T] [--arm-button-return-zero]` | 单条 LeRobot 采集；可用机械臂按钮结束并自动回零 |
+| `robot go-zero --allow-motion [--wait-for-button]` | 显式驱动机械臂回到配置目标姿态，不改写电机零点 |
 | `handeye sample --session S` | 手眼标定采样：人工摆姿态，回车记录一帧（不自动规划运动） |
 | `handeye solve --session S [--method M] [--verify-session S2] [--redetect]` | 求解 + 留出验证，写入 `calibrations/handeye/` |
 | `handeye verify --calibration-id ID --session S` | 用指定会话验证已有标定 |

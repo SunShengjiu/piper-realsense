@@ -23,6 +23,19 @@ from .camera import RealsenseCamera
 from .clock import DeviceClockMapper, RobotStateMatcher
 from .config import dataset_root as resolve_root
 from .kinematics import ForwardKinematics
+from .motion import (
+    CAN_CTRL_MODE,
+    TEACHING_EXECUTION_ARM_STATUS,
+    TEACHING_PAUSE_ARM_STATUS,
+    TEACHING_RECORD_ARM_STATUS,
+    TEACHING_START_STATUS,
+    TEACHING_STOP_STATUS,
+    TEACHING_CTRL_MODES,
+    MotionError,
+    MotionResult,
+    PiperMotionController,
+    validate_target_pose,
+)
 from .robot import GripperCalibration, RobotReader, RobotState
 
 
@@ -160,13 +173,55 @@ def make_features(height: int, width: int, wrist_depth_scale_m: float, third_dep
 class LeRobotCaptureSession:
     """Capture two serial-bound D435i streams and PiPER feedback into v3."""
 
-    def __init__(self, cfg: Dict[str, Any], *, base_dir: Path, duration_s: Optional[float] = None, task: str = "piper observation"):
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        base_dir: Path,
+        duration_s: Optional[float] = None,
+        task: str = "piper observation",
+        arm_button_return_zero: bool = False,
+        return_on_q: bool = False,
+        return_pose_deg: Optional[list[float]] = None,
+    ):
         self.cfg = cfg
         self.base_dir = Path(base_dir).resolve()
         self.duration_s = duration_s
         self.task = task
+        motion_cfg = cfg.get("robot", {}).get("motion", {})
+        self.arm_button_return_zero = bool(
+            arm_button_return_zero or motion_cfg.get("return_to_zero_on_arm_button", False)
+        )
+        # The interactive workflow treats q as the end-of-episode key.  When
+        # that workflow is enabled, the user's configured capture start pose
+        # is the useful default return target; an explicit --target-deg still
+        # overrides it.
+        self.return_on_q = bool(return_on_q or self.arm_button_return_zero)
+        if self.return_on_q and return_pose_deg is None:
+            pose_cfg = cfg.get("robot", {}).get("start_pose", {}).get("joint_positions_deg", [0.0] * 6)
+        else:
+            pose_cfg = cfg.get("robot", {}).get("return_pose", {}).get("joint_positions_deg", [0.0] * 6)
+        self.return_pose_deg = validate_target_pose(
+            return_pose_deg if return_pose_deg is not None else pose_cfg
+        )
+        self.motion_cfg = {
+            "speed_percent": int(motion_cfg.get("speed_percent", 20)),
+            "command_hz": float(motion_cfg.get("command_hz", 100.0)),
+            "timeout_s": float(motion_cfg.get("timeout_s", 20.0)),
+            "enable_timeout_s": float(motion_cfg.get("enable_timeout_s", 3.0)),
+            "tolerance_deg": float(motion_cfg.get("tolerance_deg", 1.0)),
+            "settle_s": float(motion_cfg.get("settle_s", 0.5)),
+            "reset_timeout_s": float(motion_cfg.get("reset_timeout_s", 3.0)),
+        }
         self.stop_event = __import__("threading").Event()
         self._recent: Deque[RobotState] = deque(maxlen=256)
+        self._capture_active = False
+        self._mode_seen_teaching = False
+        self._teach_recording_seen = False
+        self._last_ctrl_mode: Optional[int] = None
+        self._last_arm_status: Optional[int] = None
+        self._last_teach_status: Optional[int] = None
+        self._stop_reason: Optional[str] = None
         self.wrist: Optional[RealsenseCamera] = None
         self.third: Optional[RealsenseCamera] = None
         self.reader: Optional[RobotReader] = None
@@ -175,10 +230,20 @@ class LeRobotCaptureSession:
         self.summary: Dict[str, Any] = {
             "status": "failed", "frames_written": 0, "unmatched_camera_pairs": 0,
             "missing_wrist": 0, "missing_third_person": 0, "robot_invalid": 0,
-            "match_errors_ms": [], "encoder_drops": {},
+            "match_errors_ms": [], "encoder_drops": {}, "stop_reason": None,
+            "return_to_zero": None,
         }
 
     def request_stop(self, *_: Any) -> None:
+        if self._stop_reason is None:
+            self._stop_reason = "operator_stop"
+        self.stop_event.set()
+
+    def request_q(self, *_: Any) -> None:
+        """Finish an interactive episode through the q-specific signal."""
+
+        if self._stop_reason is None:
+            self._stop_reason = "operator_q"
         self.stop_event.set()
 
     def _install_signals(self) -> None:
@@ -187,9 +252,92 @@ class LeRobotCaptureSession:
                 signal.signal(sig, self.request_stop)
             except ValueError:
                 pass
+        # The interactive wrapper uses SIGUSR1 for q so Ctrl-C can retain its
+        # abort semantics while q can request the configured return pose.
+        if hasattr(signal, "SIGUSR1"):
+            try:
+                signal.signal(signal.SIGUSR1, self.request_q)
+            except ValueError:
+                pass
 
     def _on_robot_state(self, state: RobotState) -> None:
         self._recent.append(state)
+        status = state.arm_status or {}
+        mode_value = status.get("ctrl_mode")
+        try:
+            mode = int(mode_value) if mode_value is not None else None
+        except (TypeError, ValueError):
+            mode = None
+        arm_value = status.get("arm_status")
+        teach_value = status.get("teach_status")
+        try:
+            arm_status = int(arm_value) if arm_value is not None else None
+        except (TypeError, ValueError):
+            arm_status = None
+        try:
+            teach_status = int(teach_value) if teach_value is not None else None
+        except (TypeError, ValueError):
+            teach_status = None
+        if mode in TEACHING_CTRL_MODES:
+            self._mode_seen_teaching = True
+        recording = bool(
+            teach_status == TEACHING_START_STATUS
+            or arm_status == TEACHING_RECORD_ARM_STATUS
+        )
+        if recording:
+            self._teach_recording_seen = True
+        direct_can = bool(
+            self._capture_active
+            and self._mode_seen_teaching
+            and mode == CAN_CTRL_MODE
+            and self._last_ctrl_mode not in (None, CAN_CTRL_MODE)
+        )
+        stopped_recording = bool(
+            self._capture_active
+            and (
+                (
+                    mode in TEACHING_CTRL_MODES
+                    and teach_status == TEACHING_STOP_STATUS
+                    and self._last_teach_status not in (None, TEACHING_STOP_STATUS)
+                )
+                or (
+                    self._teach_recording_seen
+                    and
+                    self._last_arm_status == TEACHING_RECORD_ARM_STATUS
+                    and not recording
+                    and arm_status not in (TEACHING_EXECUTION_ARM_STATUS, TEACHING_PAUSE_ARM_STATUS)
+                )
+            )
+        )
+        if direct_can or stopped_recording:
+            self._stop_reason = "arm_button_teach_to_can" if direct_can else "arm_button_teach_record_stop"
+            self.summary["stop_reason"] = self._stop_reason
+            print(
+                "检测到机械臂示教按钮结束记录，正在结束当前 episode；"
+                "保存后先退出示教模式，再回到零位。"
+                if stopped_recording
+                else "检测到机械臂示教→CAN模式切换，正在结束当前 episode；保存完成后回到零位。",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.stop_event.set()
+        self._last_ctrl_mode = mode
+        self._last_arm_status = arm_status
+        self._last_teach_status = teach_status
+
+    def _return_to_zero(self) -> MotionResult:
+        if self.reader is None or getattr(self.reader, "_piper", None) is None:
+            raise MotionError("回零时 PiPER 连接已关闭")
+        controller = PiperMotionController(
+            self.reader._piper,
+            target_deg=self.return_pose_deg,
+            # The J6 button ends recording but leaves ctrl_mode=0x02.  The
+            # explicit button workflow is authorized to issue the documented
+            # reset-to-standby command before selecting CAN.
+            reset_teaching=self.arm_button_return_zero or self.return_on_q,
+            **self.motion_cfg,
+        )
+        return controller.move_to_target()
 
     def _camera(self, spec: Dict[str, Any]) -> RealsenseCamera:
         s = spec["streams"]
@@ -297,6 +445,19 @@ class LeRobotCaptureSession:
             "action": {"status": "unavailable", "reason": "read-only capture has no command channel; feedback is never copied as action"},
             "depth_inputs": "float32 metres after per-camera raw_uint16 * measured depth_scale_m",
             "depth_encoder": {"depth_min_m": depth_cfg.depth_min, "depth_max_m": depth_cfg.depth_max, "shift_m": depth_cfg.shift, "use_log": depth_cfg.use_log, "vcodec": depth_cfg.vcodec, "pix_fmt": depth_cfg.pix_fmt},
+            "arm_button_workflow": {
+                "enabled": self.arm_button_return_zero,
+                "trigger": "teaching button stop (teach_status=0x02 or arm_status 0x0B -> normal), or direct teaching -> CAN",
+                "teaching_exit": "piper_sdk ResetPiper (emergency_stop=0x02) -> standby -> ModeCtrl CAN",
+                "return_pose_deg": list(self.return_pose_deg),
+                "zero_semantics": "move_to_pose; motor encoder zero is unchanged",
+            },
+            "q_return_workflow": {
+                "enabled": self.return_on_q,
+                "trigger": "interactive q (SIGUSR1)",
+                "return_pose_deg": list(self.return_pose_deg),
+                "zero_semantics": "move_to_pose; motor encoder zero is unchanged",
+            },
         }
         # ``features[*].info`` is the official extensible metadata structure;
         # keep device identity, synchronization and the explicit unavailable
@@ -350,6 +511,7 @@ class LeRobotCaptureSession:
                 fk, tolerance_ms=float(sync["robot_tolerance_ms"]),
                 max_state_age_ms=float(sync["max_robot_state_age_ms"]), mode=str(sync["robot_match_mode"]),
             )
+            self._capture_active = True
             started = time.monotonic()
             progress_last_s = 0.0
             print(
@@ -359,6 +521,14 @@ class LeRobotCaptureSession:
                 file=sys.stderr,
                 flush=True,
             )
+            if self.arm_button_return_zero or self.return_on_q:
+                target_text = "[" + ", ".join(f"{v:g}" for v in self.return_pose_deg) + "]°"
+                print(
+                    "已启用自动回位：按 q 结束当前 episode 后，"
+                    f"程序会先保存，再退出示教、切到 CAN 并以限速回到 {target_text}。",
+                    file=sys.stderr,
+                    flush=True,
+                )
             # Read both USB devices concurrently.  Sequential blocking reads
             # would manufacture an approximately one-frame timestamp offset.
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="d435i-read") as pool:
@@ -413,6 +583,10 @@ class LeRobotCaptureSession:
                         file=sys.stderr,
                         flush=True,
                     )
+            self._capture_active = False
+            if self._stop_reason is None:
+                self._stop_reason = "duration" if self.duration_s is not None else "capture_loop_stopped"
+            self.summary["stop_reason"] = self._stop_reason
             # Runtime matching evidence belongs in the official feature metadata
             # so it travels with info.json; no sidecar report is created.
             errors = self.summary["match_errors_ms"]
@@ -441,13 +615,45 @@ class LeRobotCaptureSession:
                 self.dataset.finalize()
                 self.summary.update({"status": "failed_no_valid_frames", "error": "episode 没有同时满足相机和机械臂时间容差的有效帧"})
                 return self.summary
+            # save_episode() has completed the current episode's data/video
+            # writes. Keep the dataset object open until optional post-episode
+            # motion finishes so its runtime result can be recorded in metadata.
+            self.summary["status"] = "aborted" if self.stop_event.is_set() else "closed"
+            return_triggered = bool(
+                self._stop_reason in ("arm_button_teach_to_can", "arm_button_teach_record_stop")
+                and self.arm_button_return_zero
+            ) or bool(self._stop_reason == "operator_q" and self.return_on_q)
+            if return_triggered and self.summary["status"] in ("aborted", "closed"):
+                try:
+                    result = self._return_to_zero()
+                    self.summary["return_to_zero"] = result.to_dict()
+                    if result.status != "success":
+                        self.summary["status"] = "failed_return_to_zero"
+                        self.summary["error"] = result.reason or "回零未达到目标"
+                    else:
+                        target_text = "[" + ", ".join(f"{v:g}" for v in self.return_pose_deg) + "]°"
+                        print(
+                            f"当前 episode 已保存，机械臂已回到配置目标 {target_text}。",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except Exception as exc:
+                    self.summary["return_to_zero"] = {
+                        "status": "error",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                        "target_joint_positions_deg": list(self.return_pose_deg),
+                        "zero_semantics": "move_to_pose; motor encoder zero is unchanged",
+                    }
+                    self.summary["status"] = "failed_return_to_zero"
+                    self.summary["error"] = str(exc)
+            self.dataset.meta.features["sync_error_ms"].setdefault("info", {})[
+                "runtime_return_to_zero"
+            ] = self.summary["return_to_zero"]
             self.dataset.finalize()
             drops = getattr(getattr(self.dataset, "writer", None), "_streaming_encoder", None)
             self.summary["encoder_drops"] = dict(getattr(drops, "_dropped_frames", {}) or {})
             if self.summary["encoder_drops"]:
                 self.summary["status"] = "failed_encoder_backpressure"
-            else:
-                self.summary["status"] = "aborted" if self.stop_event.is_set() else "closed"
             self.summary["output_root"] = str(self.dataset.root)
             self.summary["lerobot_version"] = "0.6.1"
             return self.summary
@@ -462,6 +668,7 @@ class LeRobotCaptureSession:
                     pass
             return self.summary
         finally:
+            self._capture_active = False
             if self.reader is not None:
                 self.reader.close()
             if self.wrist is not None:

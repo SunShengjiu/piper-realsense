@@ -6,6 +6,7 @@
   config     运行配置
   kinematics 正运动学（反馈关节角 -> EE 位姿）、FK 交叉校验
   robot      只读机械臂反馈采集
+  motion     显式开启的 PiPER 回零运动与模式触发
   camera     D435i RGB-D 采集
   clock      时钟域与时间匹配
   episode    episode 采集写入与断点保留

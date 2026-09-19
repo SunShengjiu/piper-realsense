@@ -114,7 +114,16 @@ def apply_options(device: Any, rs: Any, settings: Dict[str, Dict[str, float]]) -
     for kind, values in settings.items():
         if kind not in ('color', 'depth') or not isinstance(values, dict):
             raise ValueError(f'非法 sensor_options 分组: {kind}')
-        priority = lambda name: (0 if name == 'visual_preset' else 1 if name.startswith('enable_auto') else 2, name)
+        # Some D435i firmware rewrites the RGB exposure when another UVC
+        # control (for example gamma) is changed afterward. Keep manual
+        # exposure/gain last so the requested setpoint is the final state.
+        priority = lambda name: (
+            0 if name == 'visual_preset' else
+            1 if name.startswith('enable_auto') else
+            4 if name == 'exposure' else
+            3 if name in ('gain', 'white_balance') else 2,
+            name,
+        )
         for name in sorted(values, key=priority):
             if values.get(AUTO_FOR.get(name, '')):
                 continue
